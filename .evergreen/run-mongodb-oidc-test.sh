@@ -21,12 +21,13 @@ elif [ $OIDC_ENV == "azure" ]; then
 elif [ $OIDC_ENV == "gcp" ]; then
     source ./secrets-export.sh
 
+elif [ $OIDC_ENV == "k8s" ]; then
+    echo "Running oidc on k8s"
+
 else
     echo "Unrecognized OIDC_ENV $OIDC_ENV"
     exit 1
 fi
 
-export TEST_AUTH_OIDC=1
-export COVERAGE=1
-export AUTH="auth"
-bash ./.evergreen/tox.sh -m test-eg -- "${@:1}"
+TEST_AUTH_OIDC=1 COVERAGE=1 AUTH="auth" bash ./.evergreen/just.sh setup-test
+bash ./.evergreen/just.sh test-eg "${@:1}"

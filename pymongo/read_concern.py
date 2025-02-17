@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tools for working with read concerns."""
+"""Tools for working with read concerns.
+
+.. seealso:: This module is compatible with both the synchronous and asynchronous PyMongo APIs.
+"""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -35,7 +38,7 @@ class ReadConcern:
         if level is None or isinstance(level, str):
             self.__level = level
         else:
-            raise TypeError("level must be a string or None.")
+            raise TypeError(f"level must be a string or None, not {type(level)}")
 
     @property
     def level(self) -> Optional[str]:

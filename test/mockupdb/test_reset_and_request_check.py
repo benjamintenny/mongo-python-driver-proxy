@@ -16,17 +16,29 @@ from __future__ import annotations
 import itertools
 import time
 import unittest
+from test import PyMongoTestCase
 
-from mockupdb import MockupDB, going, wait_until
+import pytest
+
+try:
+    from mockupdb import MockupDB, going, wait_until
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
+
 from operations import operations  # type: ignore[import]
 
-from pymongo import MongoClient
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
 from pymongo.errors import ConnectionFailure
 from pymongo.operations import _Op
 from pymongo.server_type import SERVER_TYPE
 
+pytestmark = pytest.mark.mockupdb
 
-class TestResetAndRequestCheck(unittest.TestCase):
+
+class TestResetAndRequestCheck(PyMongoTestCase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ismaster_time = 0.0
@@ -38,7 +50,9 @@ class TestResetAndRequestCheck(unittest.TestCase):
 
         def responder(request):
             self.ismaster_time = time.time()
-            return request.ok(ismaster=True, minWireVersion=2, maxWireVersion=6)
+            return request.ok(
+                ismaster=True, minWireVersion=2, maxWireVersion=MIN_SUPPORTED_WIRE_VERSION
+            )
 
         self.server.autoresponds("ismaster", responder)
         self.server.run()
@@ -47,7 +61,7 @@ class TestResetAndRequestCheck(unittest.TestCase):
         kwargs = {"socketTimeoutMS": 100}
         # Disable retryable reads when pymongo supports it.
         kwargs["retryReads"] = False
-        self.client = MongoClient(self.server.uri, **kwargs)  # type: ignore
+        self.client = self.simple_client(self.server.uri, **kwargs)  # type: ignore
         wait_until(lambda: self.client.nodes, "connect to standalone")
 
     def tearDown(self):

@@ -15,48 +15,54 @@
 """Utilities for testing driver specs."""
 from __future__ import annotations
 
+import asyncio
 import functools
-import threading
+import os
+import unittest
+from asyncio import iscoroutinefunction
 from collections import abc
 from test import IntegrationTest, client_context, client_knobs
+from test.helpers import ConcurrentRunner
 from test.utils import (
     CMAPListener,
     CompareType,
     EventListener,
     OvertCommandListener,
+    ScenarioDict,
     ServerAndTopologyEventListener,
     camel_to_snake,
     camel_to_snake_args,
     parse_spec_options,
     prepare_spec_arguments,
-    rs_client,
 )
 from typing import List
 
-from bson import ObjectId, decode, encode
+from bson import ObjectId, decode, encode, json_util
 from bson.binary import Binary
 from bson.int64 import Int64
 from bson.son import SON
 from gridfs import GridFSBucket
-from pymongo import client_session
-from pymongo.command_cursor import CommandCursor
-from pymongo.cursor import Cursor
-from pymongo.errors import BulkWriteError, OperationFailure, PyMongoError
+from gridfs.synchronous.grid_file import GridFSBucket
+from pymongo.errors import AutoReconnect, BulkWriteError, OperationFailure, PyMongoError
+from pymongo.lock import _cond_wait, _create_condition, _create_lock
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference
 from pymongo.results import BulkWriteResult, _WriteResult
+from pymongo.synchronous import client_session
+from pymongo.synchronous.command_cursor import CommandCursor
+from pymongo.synchronous.cursor import Cursor
 from pymongo.write_concern import WriteConcern
 
+_IS_SYNC = True
 
-class SpecRunnerThread(threading.Thread):
+
+class SpecRunnerThread(ConcurrentRunner):
     def __init__(self, name):
-        super().__init__()
-        self.name = name
+        super().__init__(name=name)
         self.exc = None
         self.daemon = True
-        self.cond = threading.Condition()
+        self.cond = _create_condition(_create_lock())
         self.ops = []
-        self.stopped = False
 
     def schedule(self, work):
         self.ops.append(work)
@@ -72,7 +78,7 @@ class SpecRunnerThread(threading.Thread):
         while not self.stopped or self.ops:
             if not self.ops:
                 with self.cond:
-                    self.cond.wait(10)
+                    _cond_wait(self.cond, 10)
             if self.ops:
                 try:
                     work = self.ops.pop(0)
@@ -82,32 +88,181 @@ class SpecRunnerThread(threading.Thread):
                     self.stop()
 
 
+class SpecTestCreator:
+    """Class to create test cases from specifications."""
+
+    def __init__(self, create_test, test_class, test_path):
+        """Create a TestCreator object.
+
+        :Parameters:
+          - `create_test`: callback that returns a test case. The callback
+            must accept the following arguments - a dictionary containing the
+            entire test specification (the `scenario_def`), a dictionary
+            containing the specification for which the test case will be
+            generated (the `test_def`).
+          - `test_class`: the unittest.TestCase class in which to create the
+            test case.
+          - `test_path`: path to the directory containing the JSON files with
+            the test specifications.
+        """
+        self._create_test = create_test
+        self._test_class = test_class
+        self.test_path = test_path
+
+    def _ensure_min_max_server_version(self, scenario_def, method):
+        """Test modifier that enforces a version range for the server on a
+        test case.
+        """
+        if "minServerVersion" in scenario_def:
+            min_ver = tuple(int(elt) for elt in scenario_def["minServerVersion"].split("."))
+            if min_ver is not None:
+                method = client_context.require_version_min(*min_ver)(method)
+
+        if "maxServerVersion" in scenario_def:
+            max_ver = tuple(int(elt) for elt in scenario_def["maxServerVersion"].split("."))
+            if max_ver is not None:
+                method = client_context.require_version_max(*max_ver)(method)
+
+        if "serverless" in scenario_def:
+            serverless = scenario_def["serverless"]
+            if serverless == "require":
+                serverless_satisfied = client_context.serverless
+            elif serverless == "forbid":
+                serverless_satisfied = not client_context.serverless
+            else:  # unset or "allow"
+                serverless_satisfied = True
+            method = unittest.skipUnless(
+                serverless_satisfied, "Serverless requirement not satisfied"
+            )(method)
+
+        return method
+
+    @staticmethod
+    def valid_topology(run_on_req):
+        return client_context.is_topology_type(
+            run_on_req.get("topology", ["single", "replicaset", "sharded", "load-balanced"])
+        )
+
+    @staticmethod
+    def min_server_version(run_on_req):
+        version = run_on_req.get("minServerVersion")
+        if version:
+            min_ver = tuple(int(elt) for elt in version.split("."))
+            return client_context.version >= min_ver
+        return True
+
+    @staticmethod
+    def max_server_version(run_on_req):
+        version = run_on_req.get("maxServerVersion")
+        if version:
+            max_ver = tuple(int(elt) for elt in version.split("."))
+            return client_context.version <= max_ver
+        return True
+
+    @staticmethod
+    def valid_auth_enabled(run_on_req):
+        if "authEnabled" in run_on_req:
+            if run_on_req["authEnabled"]:
+                return client_context.auth_enabled
+            return not client_context.auth_enabled
+        return True
+
+    @staticmethod
+    def serverless_ok(run_on_req):
+        serverless = run_on_req["serverless"]
+        if serverless == "require":
+            return client_context.serverless
+        elif serverless == "forbid":
+            return not client_context.serverless
+        else:  # unset or "allow"
+            return True
+
+    def should_run_on(self, scenario_def):
+        run_on = scenario_def.get("runOn", [])
+        if not run_on:
+            # Always run these tests.
+            return True
+
+        for req in run_on:
+            if (
+                self.valid_topology(req)
+                and self.min_server_version(req)
+                and self.max_server_version(req)
+                and self.valid_auth_enabled(req)
+                and self.serverless_ok(req)
+            ):
+                return True
+        return False
+
+    def ensure_run_on(self, scenario_def, method):
+        """Test modifier that enforces a 'runOn' on a test case."""
+
+        def predicate():
+            return self.should_run_on(scenario_def)
+
+        return client_context._require(predicate, "runOn not satisfied", method)
+
+    def tests(self, scenario_def):
+        """Allow CMAP spec test to override the location of test."""
+        return scenario_def["tests"]
+
+    def _create_tests(self):
+        for dirpath, _, filenames in os.walk(self.test_path):
+            dirname = os.path.split(dirpath)[-1]
+
+            for filename in filenames:
+                with open(os.path.join(dirpath, filename)) as scenario_stream:  # noqa: ASYNC101, RUF100
+                    # Use tz_aware=False to match how CodecOptions decodes
+                    # dates.
+                    opts = json_util.JSONOptions(tz_aware=False)
+                    scenario_def = ScenarioDict(
+                        json_util.loads(scenario_stream.read(), json_options=opts)
+                    )
+
+                test_type = os.path.splitext(filename)[0]
+
+                # Construct test from scenario.
+                for test_def in self.tests(scenario_def):
+                    test_name = "test_{}_{}_{}".format(
+                        dirname,
+                        test_type.replace("-", "_").replace(".", "_"),
+                        str(test_def["description"].replace(" ", "_").replace(".", "_")),
+                    )
+
+                    new_test = self._create_test(scenario_def, test_def, test_name)
+                    new_test = self._ensure_min_max_server_version(scenario_def, new_test)
+                    new_test = self.ensure_run_on(scenario_def, new_test)
+
+                    new_test.__name__ = test_name
+                    setattr(self._test_class, new_test.__name__, new_test)
+
+    def create_tests(self):
+        if _IS_SYNC:
+            self._create_tests()
+        else:
+            asyncio.run(self._create_tests())
+
+
 class SpecRunner(IntegrationTest):
     mongos_clients: List
     knobs: client_knobs
     listener: EventListener
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.mongos_clients = []
+    def setUp(self) -> None:
+        super().setUp()
+        self.mongos_clients = []
 
         # Speed up the tests by decreasing the heartbeat frequency.
-        cls.knobs = client_knobs(heartbeat_frequency=0.1, min_heartbeat_interval=0.1)
-        cls.knobs.enable()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.knobs.disable()
-        super().tearDownClass()
-
-    def setUp(self):
-        super().setUp()
+        self.knobs = client_knobs(heartbeat_frequency=0.1, min_heartbeat_interval=0.1)
+        self.knobs.enable()
         self.targets = {}
         self.listener = None  # type: ignore
         self.pool_listener = None
         self.server_listener = None
         self.maxDiff = None
+
+    def tearDown(self) -> None:
+        self.knobs.disable()
 
     def _set_fail_point(self, client, command_args):
         cmd = SON([("configureFailPoint", "failCommand")])
@@ -179,9 +334,10 @@ class SpecRunner(IntegrationTest):
         for client in clients:
             try:
                 client.admin.command("killAllSessions", [])
-            except OperationFailure:
+            except (OperationFailure, AutoReconnect):
                 # "operation was interrupted" by killing the command's
                 # own session.
+                # On 8.0+ killAllSessions sometimes returns a network error.
                 pass
 
     def check_command_result(self, expected_result, result):
@@ -309,7 +465,10 @@ class SpecRunner(IntegrationTest):
             args.update(arguments)
             arguments = args
 
-        result = cmd(**dict(arguments))
+        if not _IS_SYNC and iscoroutinefunction(cmd):
+            result = cmd(**dict(arguments))
+        else:
+            result = cmd(**dict(arguments))
         # Cleanup open change stream cursors.
         if name == "watch":
             self.addCleanup(result.close)
@@ -325,7 +484,7 @@ class SpecRunner(IntegrationTest):
             result = Binary(result.read())
 
         if isinstance(result, Cursor) or isinstance(result, CommandCursor):
-            return list(result)
+            return result.to_list()
 
         return result
 
@@ -522,15 +681,13 @@ class SpecRunner(IntegrationTest):
                 host = client_context.MULTI_MONGOS_LB_URI
             elif client_context.is_mongos:
                 host = client_context.mongos_seeds()
-        client = rs_client(
+        client = self.rs_client(
             h=host, event_listeners=[listener, pool_listener, server_listener], **client_options
         )
         self.scenario_client = client
         self.listener = listener
         self.pool_listener = pool_listener
         self.server_listener = server_listener
-        # Close the client explicitly to avoid having too many threads open.
-        self.addCleanup(client.close)
 
         # Create session0 and session1.
         sessions = {}
@@ -580,7 +737,7 @@ class SpecRunner(IntegrationTest):
                 read_preference=ReadPreference.PRIMARY,
                 read_concern=ReadConcern("local"),
             )
-            actual_data = list(outcome_coll.find(sort=[("_id", 1)]))
+            actual_data = outcome_coll.find(sort=[("_id", 1)]).to_list()
 
             # The expected data needs to be the left hand side here otherwise
             # CompareType(Binary) doesn't work.

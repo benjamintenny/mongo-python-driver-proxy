@@ -15,20 +15,22 @@
 """Run the SRV support tests."""
 from __future__ import annotations
 
+import asyncio
 import sys
-from time import sleep
+import time
 from typing import Any
 
 sys.path[0:0] = [""]
 
-from test import client_knobs, unittest
+from test import PyMongoTestCase, client_knobs, unittest
 from test.utils import FunctionCallRecorder, wait_until
 
 import pymongo
 from pymongo import common
 from pymongo.errors import ConfigurationError
-from pymongo.mongo_client import MongoClient
-from pymongo.srv_resolver import _HAVE_DNSPYTHON
+from pymongo.srv_resolver import _have_dnspython
+
+_IS_SYNC = True
 
 WAIT_TIME = 0.1
 
@@ -79,14 +81,14 @@ class SrvPollingKnobs:
     def disable(self):
         common.MIN_SRV_RESCAN_INTERVAL = self.old_min_srv_rescan_interval  # type: ignore
         pymongo.srv_resolver._SrvResolver.get_hosts_and_min_ttl = (  # type: ignore
-            self.old_dns_resolver_response  # type: ignore
+            self.old_dns_resolver_response
         )
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.disable()
 
 
-class TestSrvPolling(unittest.TestCase):
+class TestSrvPolling(PyMongoTestCase):
     BASE_SRV_RESPONSE = [
         ("localhost.test.build.10gen.cc", 27017),
         ("localhost.test.build.10gen.cc", 27018),
@@ -148,7 +150,7 @@ class TestSrvPolling(unittest.TestCase):
         return True
 
     def run_scenario(self, dns_response, expect_change):
-        self.assertEqual(_HAVE_DNSPYTHON, True)
+        self.assertEqual(_have_dnspython(), True)
         if callable(dns_response):
             dns_resolver_response = dns_response
         else:
@@ -167,7 +169,8 @@ class TestSrvPolling(unittest.TestCase):
 
         # Patch timeouts to ensure short test running times.
         with SrvPollingKnobs(ttl_time=WAIT_TIME, min_srv_rescan_interval=WAIT_TIME):
-            client = MongoClient(self.CONNECTION_STRING)
+            client = self.simple_client(self.CONNECTION_STRING)
+            client._connect()
             self.assert_nodelist_change(self.BASE_SRV_RESPONSE, client)
             # Patch list of hosts returned by DNS query.
             with SrvPollingKnobs(
@@ -231,7 +234,8 @@ class TestSrvPolling(unittest.TestCase):
             count_resolver_calls=True,
         ):
             # Client uses unpatched method to get initial nodelist
-            client = MongoClient(self.CONNECTION_STRING)
+            client = self.simple_client(self.CONNECTION_STRING)
+            client._connect()
             # Invalid DNS resolver response should not change nodelist.
             self.assert_nodelist_nochange(self.BASE_SRV_RESPONSE, client)
 
@@ -264,8 +268,8 @@ class TestSrvPolling(unittest.TestCase):
             return response
 
         with SrvPollingKnobs(ttl_time=WAIT_TIME, min_srv_rescan_interval=WAIT_TIME):
-            client = MongoClient(self.CONNECTION_STRING, srvMaxHosts=0)
-            self.addCleanup(client.close)
+            client = self.simple_client(self.CONNECTION_STRING, srvMaxHosts=0)
+            client._connect()
             with SrvPollingKnobs(nodelist_callback=nodelist_callback):
                 self.assert_nodelist_change(response, client)
 
@@ -279,8 +283,8 @@ class TestSrvPolling(unittest.TestCase):
             return response
 
         with SrvPollingKnobs(ttl_time=WAIT_TIME, min_srv_rescan_interval=WAIT_TIME):
-            client = MongoClient(self.CONNECTION_STRING, srvMaxHosts=2)
-            self.addCleanup(client.close)
+            client = self.simple_client(self.CONNECTION_STRING, srvMaxHosts=2)
+            client._connect()
             with SrvPollingKnobs(nodelist_callback=nodelist_callback):
                 self.assert_nodelist_change(response, client)
 
@@ -295,20 +299,20 @@ class TestSrvPolling(unittest.TestCase):
             return response
 
         with SrvPollingKnobs(ttl_time=WAIT_TIME, min_srv_rescan_interval=WAIT_TIME):
-            client = MongoClient(self.CONNECTION_STRING, srvMaxHosts=2)
-            self.addCleanup(client.close)
+            client = self.simple_client(self.CONNECTION_STRING, srvMaxHosts=2)
+            client._connect()
             with SrvPollingKnobs(nodelist_callback=nodelist_callback):
-                sleep(2 * common.MIN_SRV_RESCAN_INTERVAL)
+                time.sleep(2 * common.MIN_SRV_RESCAN_INTERVAL)
                 final_topology = set(client.topology_description.server_descriptions())
                 self.assertIn(("localhost.test.build.10gen.cc", 27017), final_topology)
                 self.assertEqual(len(final_topology), 2)
 
     def test_does_not_flipflop(self):
         with SrvPollingKnobs(ttl_time=WAIT_TIME, min_srv_rescan_interval=WAIT_TIME):
-            client = MongoClient(self.CONNECTION_STRING, srvMaxHosts=1)
-            self.addCleanup(client.close)
+            client = self.simple_client(self.CONNECTION_STRING, srvMaxHosts=1)
+            client._connect()
             old = set(client.topology_description.server_descriptions())
-            sleep(4 * WAIT_TIME)
+            time.sleep(4 * WAIT_TIME)
             new = set(client.topology_description.server_descriptions())
             self.assertSetEqual(old, new)
 
@@ -323,9 +327,10 @@ class TestSrvPolling(unittest.TestCase):
             return response
 
         with SrvPollingKnobs(ttl_time=WAIT_TIME, min_srv_rescan_interval=WAIT_TIME):
-            client = MongoClient(
+            client = self.simple_client(
                 "mongodb+srv://test22.test.build.10gen.cc/?srvServiceName=customname"
             )
+            client._connect()
             with SrvPollingKnobs(nodelist_callback=nodelist_callback):
                 self.assert_nodelist_change(response, client)
 
@@ -340,10 +345,10 @@ class TestSrvPolling(unittest.TestCase):
             min_srv_rescan_interval=WAIT_TIME,
             nodelist_callback=resolver_response,
         ):
-            client = MongoClient(self.CONNECTION_STRING)
-            self.assertRaises(
-                AssertionError, self.assert_nodelist_change, modified, client, timeout=WAIT_TIME / 2
-            )
+            client = self.simple_client(self.CONNECTION_STRING)
+            client._connect()
+            with self.assertRaises(AssertionError):
+                self.assert_nodelist_change(modified, client, timeout=WAIT_TIME / 2)
 
     def test_import_dns_resolver(self):
         # Regression test for PYTHON-4407

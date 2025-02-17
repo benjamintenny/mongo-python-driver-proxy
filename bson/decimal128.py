@@ -223,7 +223,7 @@ class Decimal128:
                     "from list or tuple. Must have exactly 2 "
                     "elements."
                 )
-            self.__high, self.__low = value  # type: ignore
+            self.__high, self.__low = value
         else:
             raise TypeError(f"Cannot convert {value!r} to Decimal128")
 
@@ -277,7 +277,7 @@ class Decimal128:
             point in Binary Integer Decimal (BID) format).
         """
         if not isinstance(value, bytes):
-            raise TypeError("value must be an instance of bytes")
+            raise TypeError(f"value must be an instance of bytes, not {type(value)}")
         if len(value) != 16:
             raise ValueError("value must be exactly 16 bytes")
         return cls((_UNPACK_64(value[8:])[0], _UNPACK_64(value[:8])[0]))  # type: ignore

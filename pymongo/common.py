@@ -40,8 +40,6 @@ from bson import SON
 from bson.binary import UuidRepresentation
 from bson.codec_options import CodecOptions, DatetimeConversion, TypeRegistry
 from bson.raw_bson import RawBSONDocument
-from pymongo.auth import MECHANISMS
-from pymongo.auth_oidc import OIDCCallback
 from pymongo.compression_support import (
     validate_compressors,
     validate_zlib_compression_level,
@@ -55,21 +53,23 @@ from pymongo.server_api import ServerApi
 from pymongo.write_concern import DEFAULT_WRITE_CONCERN, WriteConcern, validate_boolean
 
 if TYPE_CHECKING:
-    from pymongo.client_session import ClientSession
+    from pymongo.typings import _AgnosticClientSession
+
 
 ORDERED_TYPES: Sequence[Type] = (SON, OrderedDict)
 
 # Defaults until we connect to a server and get updated limits.
 MAX_BSON_SIZE = 16 * (1024**2)
-MAX_MESSAGE_SIZE: int = 2 * MAX_BSON_SIZE
+MAX_MESSAGE_SIZE = 48 * 1000 * 1000
 MIN_WIRE_VERSION = 0
 MAX_WIRE_VERSION = 0
-MAX_WRITE_BATCH_SIZE = 1000
+MAX_WRITE_BATCH_SIZE = 100000
 
 # What this version of PyMongo supports.
-MIN_SUPPORTED_SERVER_VERSION = "3.6"
-MIN_SUPPORTED_WIRE_VERSION = 6
-MAX_SUPPORTED_WIRE_VERSION = 21
+MIN_SUPPORTED_SERVER_VERSION = "4.0"
+MIN_SUPPORTED_WIRE_VERSION = 7
+# MongoDB 8.0
+MAX_SUPPORTED_WIRE_VERSION = 25
 
 # Frequency to call hello on servers, in seconds.
 HEARTBEAT_FREQUENCY = 10
@@ -139,6 +139,9 @@ SRV_SERVICE_NAME = "mongodb"
 # Default value for serverMonitoringMode
 SERVER_MONITORING_MODE = "auto"  # poll/stream/auto
 
+# Auth mechanism properties that must raise an error instead of warning if they invalidate.
+_MECH_PROP_MUST_RAISE = ["CANONICALIZE_HOST_NAME"]
+
 
 def partition_node(node: str) -> tuple[str, int]:
     """Split a host:port string into (host, int(port)) pair."""
@@ -199,7 +202,7 @@ def validate_integer(option: str, value: Any) -> int:
             return int(value)
         except ValueError:
             raise ValueError(f"The value of {option} must be an integer") from None
-    raise TypeError(f"Wrong type for {option}, value must be an integer")
+    raise TypeError(f"Wrong type for {option}, value must be an integer, not {type(value)}")
 
 
 def validate_positive_integer(option: str, value: Any) -> int:
@@ -247,7 +250,7 @@ def validate_string(option: str, value: Any) -> str:
     """Validates that 'value' is an instance of `str`."""
     if isinstance(value, str):
         return value
-    raise TypeError(f"Wrong type for {option}, value must be an instance of str")
+    raise TypeError(f"Wrong type for {option}, value must be an instance of str, not {type(value)}")
 
 
 def validate_string_or_none(option: str, value: Any) -> Optional[str]:
@@ -266,7 +269,9 @@ def validate_int_or_basestring(option: str, value: Any) -> Union[int, str]:
             return int(value)
         except ValueError:
             return value
-    raise TypeError(f"Wrong type for {option}, value must be an integer or a string")
+    raise TypeError(
+        f"Wrong type for {option}, value must be an integer or a string, not {type(value)}"
+    )
 
 
 def validate_non_negative_int_or_basestring(option: Any, value: Any) -> Union[int, str]:
@@ -279,7 +284,9 @@ def validate_non_negative_int_or_basestring(option: Any, value: Any) -> Union[in
         except ValueError:
             return value
         return validate_non_negative_integer(option, val)
-    raise TypeError(f"Wrong type for {option}, value must be an non negative integer or a string")
+    raise TypeError(
+        f"Wrong type for {option}, value must be an non negative integer or a string, not {type(value)}"
+    )
 
 
 def validate_positive_float(option: str, value: Any) -> float:
@@ -362,7 +369,7 @@ def validate_max_staleness(option: str, value: Any) -> int:
 def validate_read_preference(dummy: Any, value: Any) -> _ServerMode:
     """Validate a read preference."""
     if not isinstance(value, _ServerMode):
-        raise TypeError(f"{value!r} is not a read preference.")
+        raise TypeError(f"{value!r} is not a read preference")
     return value
 
 
@@ -380,6 +387,8 @@ def validate_read_preference_mode(dummy: Any, value: Any) -> _ServerMode:
 
 def validate_auth_mechanism(option: str, value: Any) -> str:
     """Validate the authMechanism URI option."""
+    from pymongo.auth_shared import MECHANISMS
+
     if value not in MECHANISMS:
         raise ValueError(f"{option} must be in {tuple(MECHANISMS)}")
     return value
@@ -421,6 +430,7 @@ def validate_read_preference_tags(name: str, value: Any) -> list[dict[str, str]]
 _MECHANISM_PROPS = frozenset(
     [
         "SERVICE_NAME",
+        "SERVICE_HOST",
         "CANONICALIZE_HOST_NAME",
         "SERVICE_REALM",
         "AWS_SESSION_TOKEN",
@@ -435,7 +445,9 @@ def validate_auth_mechanism_properties(option: str, value: Any) -> dict[str, Uni
     props: dict[str, Any] = {}
     if not isinstance(value, str):
         if not isinstance(value, dict):
-            raise ValueError("Auth mechanism properties must be given as a string or a dictionary")
+            raise ValueError(
+                f"Auth mechanism properties must be given as a string or a dictionary, not {type(value)}"
+            )
         for key, value in value.items():  # noqa: B020
             if isinstance(value, str):
                 props[key] = value
@@ -444,16 +456,21 @@ def validate_auth_mechanism_properties(option: str, value: Any) -> dict[str, Uni
             elif key in ["ALLOWED_HOSTS"] and isinstance(value, list):
                 props[key] = value
             elif key in ["OIDC_CALLBACK", "OIDC_HUMAN_CALLBACK"]:
+                from pymongo.auth_oidc_shared import OIDCCallback
+
                 if not isinstance(value, OIDCCallback):
-                    raise ValueError("callback must be an OIDCCallback object")
+                    raise ValueError(f"callback must be an OIDCCallback object, not {type(value)}")
                 props[key] = value
             else:
                 raise ValueError(f"Invalid type for auth mechanism property {key}, {type(value)}")
         return props
 
     value = validate_string(option, value)
+    value = unquote_plus(value)
     for opt in value.split(","):
         key, _, val = opt.partition(":")
+        if not val:
+            raise ValueError("Malformed auth mechanism properties")
         if key not in _MECHANISM_PROPS:
             # Try not to leak the token.
             if "AWS_SESSION_TOKEN" in key:
@@ -465,13 +482,15 @@ def validate_auth_mechanism_properties(option: str, value: Any) -> dict[str, Uni
             raise ValueError(
                 f"{key} is not a supported auth "
                 "mechanism property. Must be one of "
-                f"{tuple(_MECHANISM_PROPS)}."
+                f"{tuple(_MECHANISM_PROPS)}"
             )
 
         if key == "CANONICALIZE_HOST_NAME":
-            props[key] = validate_boolean_or_string(key, val)
+            from pymongo.auth_shared import _validate_canonicalize_host_name
+
+            props[key] = _validate_canonicalize_host_name(val)
         else:
-            props[key] = unquote_plus(val)
+            props[key] = val
 
     return props
 
@@ -507,7 +526,7 @@ def validate_type_registry(option: Any, value: Any) -> Optional[TypeRegistry]:
 def validate_list(option: str, value: Any) -> list:
     """Validates that 'value' is a list."""
     if not isinstance(value, list):
-        raise TypeError(f"{option} must be a list")
+        raise TypeError(f"{option} must be a list, not {type(value)}")
     return value
 
 
@@ -574,7 +593,7 @@ def validate_server_api_or_none(option: Any, value: Any) -> Optional[ServerApi]:
     if value is None:
         return value
     if not isinstance(value, ServerApi):
-        raise TypeError(f"{option} must be an instance of ServerApi")
+        raise TypeError(f"{option} must be an instance of ServerApi, not {type(value)}")
     return value
 
 
@@ -583,7 +602,7 @@ def validate_is_callable_or_none(option: Any, value: Any) -> Optional[Callable]:
     if value is None:
         return value
     if not callable(value):
-        raise ValueError(f"{option} must be a callable")
+        raise ValueError(f"{option} must be a callable, not {type(value)}")
     return value
 
 
@@ -638,7 +657,7 @@ def validate_auto_encryption_opts_or_none(option: Any, value: Any) -> Optional[A
     from pymongo.encryption_options import AutoEncryptionOpts
 
     if not isinstance(value, AutoEncryptionOpts):
-        raise TypeError(f"{option} must be an instance of AutoEncryptionOpts")
+        raise TypeError(f"{option} must be an instance of AutoEncryptionOpts, not {type(value)}")
 
     return value
 
@@ -655,7 +674,9 @@ def validate_datetime_conversion(option: Any, value: Any) -> Optional[DatetimeCo
     elif isinstance(value, int):
         return DatetimeConversion(value)
 
-    raise TypeError(f"{option} must be a str or int representing DatetimeConversion")
+    raise TypeError(
+        f"{option} must be a str or int representing DatetimeConversion, not {type(value)}"
+    )
 
 
 def validate_server_monitoring_mode(option: str, value: str) -> str:
@@ -843,7 +864,7 @@ def get_validated_options(
             return x
 
         def get_setter_key(x: str) -> str:
-            return options.cased_key(x)  # type: ignore[attr-defined]
+            return options.cased_key(x)
 
     else:
         validated_options = {}
@@ -860,6 +881,12 @@ def get_validated_options(
             validator = _get_validator(opt, URI_OPTIONS_VALIDATOR_MAP, normed_key=normed_key)
             validated = validator(opt, value)
         except (ValueError, TypeError, ConfigurationError) as exc:
+            if (
+                normed_key == "authmechanismproperties"
+                and any(p in str(exc) for p in _MECH_PROP_MUST_RAISE)
+                and "is not a supported auth mechanism property" not in str(exc)
+            ):
+                raise
             if warn:
                 warnings.warn(str(exc), stacklevel=2)
             else:
@@ -897,7 +924,7 @@ class BaseObject:
     ) -> None:
         if not isinstance(codec_options, CodecOptions):
             raise TypeError("codec_options must be an instance of bson.codec_options.CodecOptions")
-        self.__codec_options = codec_options
+        self._codec_options = codec_options
 
         if not isinstance(read_preference, _ServerMode):
             raise TypeError(
@@ -905,24 +932,26 @@ class BaseObject:
                 "pymongo.read_preferences for valid "
                 "options."
             )
-        self.__read_preference = read_preference
+        self._read_preference = read_preference
 
         if not isinstance(write_concern, WriteConcern):
             raise TypeError(
-                "write_concern must be an instance of pymongo.write_concern.WriteConcern"
+                f"write_concern must be an instance of pymongo.write_concern.WriteConcern, not {type(write_concern)}"
             )
-        self.__write_concern = write_concern
+        self._write_concern = write_concern
 
         if not isinstance(read_concern, ReadConcern):
-            raise TypeError("read_concern must be an instance of pymongo.read_concern.ReadConcern")
-        self.__read_concern = read_concern
+            raise TypeError(
+                f"read_concern must be an instance of pymongo.read_concern.ReadConcern, not {type(read_concern)}"
+            )
+        self._read_concern = read_concern
 
     @property
     def codec_options(self) -> CodecOptions:
         """Read only access to the :class:`~bson.codec_options.CodecOptions`
         of this instance.
         """
-        return self.__codec_options
+        return self._codec_options
 
     @property
     def write_concern(self) -> WriteConcern:
@@ -932,9 +961,9 @@ class BaseObject:
         .. versionchanged:: 3.0
           The :attr:`write_concern` attribute is now read only.
         """
-        return self.__write_concern
+        return self._write_concern
 
-    def _write_concern_for(self, session: Optional[ClientSession]) -> WriteConcern:
+    def _write_concern_for(self, session: Optional[_AgnosticClientSession]) -> WriteConcern:
         """Read only access to the write concern of this instance or session."""
         # Override this operation's write concern with the transaction's.
         if session and session.in_transaction:
@@ -948,14 +977,14 @@ class BaseObject:
         .. versionchanged:: 3.0
           The :attr:`read_preference` attribute is now read only.
         """
-        return self.__read_preference
+        return self._read_preference
 
-    def _read_preference_for(self, session: Optional[ClientSession]) -> _ServerMode:
+    def _read_preference_for(self, session: Optional[_AgnosticClientSession]) -> _ServerMode:
         """Read only access to the read preference of this instance or session."""
         # Override this operation's read preference with the transaction's.
         if session:
-            return session._txn_read_preference() or self.__read_preference
-        return self.__read_preference
+            return session._txn_read_preference() or self._read_preference
+        return self._read_preference
 
     @property
     def read_concern(self) -> ReadConcern:
@@ -964,7 +993,7 @@ class BaseObject:
 
         .. versionadded:: 3.2
         """
-        return self.__read_concern
+        return self._read_concern
 
 
 class _CaseInsensitiveDictionary(MutableMapping[str, Any]):
@@ -1053,3 +1082,13 @@ class _CaseInsensitiveDictionary(MutableMapping[str, Any]):
 
     def cased_key(self, key: str) -> Any:
         return self.__casedkeys[key.lower()]
+
+
+def has_c() -> bool:
+    """Is the C extension installed?"""
+    try:
+        from pymongo import _cmessage  # type: ignore[attr-defined] # noqa: F401
+
+        return True
+    except ImportError:
+        return False

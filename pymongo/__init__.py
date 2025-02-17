@@ -33,6 +33,7 @@ __all__ = [
     "MIN_SUPPORTED_WIRE_VERSION",
     "CursorType",
     "MongoClient",
+    "AsyncMongoClient",
     "DeleteMany",
     "DeleteOne",
     "IndexModel",
@@ -87,10 +88,9 @@ TEXT = "text"
 
 from pymongo import _csot
 from pymongo._version import __version__, get_version_string, version_tuple
-from pymongo.collection import ReturnDocument
-from pymongo.common import MAX_SUPPORTED_WIRE_VERSION, MIN_SUPPORTED_WIRE_VERSION
+from pymongo.asynchronous.mongo_client import AsyncMongoClient
+from pymongo.common import MAX_SUPPORTED_WIRE_VERSION, MIN_SUPPORTED_WIRE_VERSION, has_c
 from pymongo.cursor import CursorType
-from pymongo.mongo_client import MongoClient
 from pymongo.operations import (
     DeleteMany,
     DeleteOne,
@@ -101,20 +101,12 @@ from pymongo.operations import (
     UpdateOne,
 )
 from pymongo.read_preferences import ReadPreference
+from pymongo.synchronous.collection import ReturnDocument
+from pymongo.synchronous.mongo_client import MongoClient
 from pymongo.write_concern import WriteConcern
 
 version = __version__
 """Current version of PyMongo."""
-
-
-def has_c() -> bool:
-    """Is the C extension installed?"""
-    try:
-        from pymongo import _cmessage  # type: ignore[attr-defined] # noqa: F401
-
-        return True
-    except ImportError:
-        return False
 
 
 def timeout(seconds: Optional[float]) -> ContextManager[None]:
@@ -168,7 +160,7 @@ def timeout(seconds: Optional[float]) -> ContextManager[None]:
     .. versionadded:: 4.2
     """
     if not isinstance(seconds, (int, float, type(None))):
-        raise TypeError("timeout must be None, an int, or a float")
+        raise TypeError(f"timeout must be None, an int, or a float, not {type(seconds)}")
     if seconds and seconds < 0:
         raise ValueError("timeout cannot be negative")
     if seconds is not None:

@@ -19,46 +19,34 @@ import sys
 import uuid
 from typing import Any, Optional
 
-from pymongo.mongo_client import MongoClient
+from pymongo.synchronous.mongo_client import MongoClient
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, client_context, unittest
-from test.utils import (
-    remove_all_users,
-    rs_or_single_client_noauth,
-    single_client,
-    wait_until,
-)
+from test import IntegrationTest, client_context, remove_all_users, unittest
+from test.utils import wait_until
 
 from bson.binary import Binary, UuidRepresentation
 from bson.codec_options import CodecOptions
 from bson.objectid import ObjectId
-from pymongo.collection import Collection
 from pymongo.common import partition_node
-from pymongo.errors import (
-    BulkWriteError,
-    ConfigurationError,
-    InvalidOperation,
-    OperationFailure,
-)
+from pymongo.errors import BulkWriteError, ConfigurationError, InvalidOperation, OperationFailure
 from pymongo.operations import *
+from pymongo.synchronous.collection import Collection
 from pymongo.write_concern import WriteConcern
+
+_IS_SYNC = True
 
 
 class BulkTestBase(IntegrationTest):
     coll: Collection
     coll_w0: Collection
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.coll = cls.db.test
-        cls.coll_w0 = cls.coll.with_options(write_concern=WriteConcern(w=0))
-
     def setUp(self):
         super().setUp()
+        self.coll = self.db.test
         self.coll.drop()
+        self.coll_w0 = self.coll.with_options(write_concern=WriteConcern(w=0))
 
     def assertEqualResponse(self, expected, actual):
         """Compare response from bulk.execute() to expected response."""
@@ -136,7 +124,8 @@ class BulkTestBase(IntegrationTest):
 
 class TestBulk(BulkTestBase):
     def test_empty(self):
-        self.assertRaises(InvalidOperation, self.coll.bulk_write, [])
+        with self.assertRaises(InvalidOperation):
+            self.coll.bulk_write([])
 
     def test_insert(self):
         expected = {
@@ -181,15 +170,19 @@ class TestBulk(BulkTestBase):
         self._test_update_many([{"$set": {"foo": "bar"}}])
 
     def test_array_filters_validation(self):
-        self.assertRaises(TypeError, UpdateMany, {}, {}, array_filters={})
-        self.assertRaises(TypeError, UpdateOne, {}, {}, array_filters={})
+        with self.assertRaises(TypeError):
+            UpdateMany({}, {}, array_filters={})  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            UpdateOne({}, {}, array_filters={})  # type: ignore[arg-type]
 
     def test_array_filters_unacknowledged(self):
         coll = self.coll_w0
         update_one = UpdateOne({}, {"$set": {"y.$[i].b": 5}}, array_filters=[{"i.b": 1}])
         update_many = UpdateMany({}, {"$set": {"y.$[i].b": 5}}, array_filters=[{"i.b": 1}])
-        self.assertRaises(ConfigurationError, coll.bulk_write, [update_one])
-        self.assertRaises(ConfigurationError, coll.bulk_write, [update_many])
+        with self.assertRaises(ConfigurationError):
+            coll.bulk_write([update_one])
+        with self.assertRaises(ConfigurationError):
+            coll.bulk_write([update_many])
 
     def _test_update_one(self, update):
         expected = {
@@ -788,12 +781,8 @@ class TestBulk(BulkTestBase):
 
 
 class BulkAuthorizationTestBase(BulkTestBase):
-    @classmethod
     @client_context.require_auth
     @client_context.require_no_api_version
-    def setUpClass(cls):
-        super().setUpClass()
-
     def setUp(self):
         super().setUp()
         client_context.create_user(self.db.name, "readonly", "pw", ["read"])
@@ -829,8 +818,16 @@ class TestBulkUnacknowledged(BulkTestBase):
         ]
         result = self.coll_w0.bulk_write(requests)
         self.assertFalse(result.acknowledged)
-        wait_until(lambda: self.coll.count_documents({}) == 2, "insert 2 documents")
-        wait_until(lambda: self.coll.find_one({"_id": 1}) is None, 'removed {"_id": 1}')
+
+        def predicate():
+            return self.coll.count_documents({}) == 2
+
+        wait_until(predicate, "insert 2 documents")
+
+        def predicate():
+            return self.coll.find_one({"_id": 1}) is None
+
+        wait_until(predicate, 'removed {"_id": 1}')
 
     def test_no_results_ordered_failure(self):
         requests: list = [
@@ -844,7 +841,11 @@ class TestBulkUnacknowledged(BulkTestBase):
         ]
         result = self.coll_w0.bulk_write(requests)
         self.assertFalse(result.acknowledged)
-        wait_until(lambda: self.coll.count_documents({}) == 3, "insert 3 documents")
+
+        def predicate():
+            return self.coll.count_documents({}) == 3
+
+        wait_until(predicate, "insert 3 documents")
         self.assertEqual({"_id": 1}, self.coll.find_one({"_id": 1}))
 
     def test_no_results_unordered_success(self):
@@ -856,8 +857,16 @@ class TestBulkUnacknowledged(BulkTestBase):
         ]
         result = self.coll_w0.bulk_write(requests, ordered=False)
         self.assertFalse(result.acknowledged)
-        wait_until(lambda: self.coll.count_documents({}) == 2, "insert 2 documents")
-        wait_until(lambda: self.coll.find_one({"_id": 1}) is None, 'removed {"_id": 1}')
+
+        def predicate():
+            return self.coll.count_documents({}) == 2
+
+        wait_until(predicate, "insert 2 documents")
+
+        def predicate():
+            return self.coll.find_one({"_id": 1}) is None
+
+        wait_until(predicate, 'removed {"_id": 1}')
 
     def test_no_results_unordered_failure(self):
         requests: list = [
@@ -871,25 +880,34 @@ class TestBulkUnacknowledged(BulkTestBase):
         ]
         result = self.coll_w0.bulk_write(requests, ordered=False)
         self.assertFalse(result.acknowledged)
-        wait_until(lambda: self.coll.count_documents({}) == 2, "insert 2 documents")
-        wait_until(lambda: self.coll.find_one({"_id": 1}) is None, 'removed {"_id": 1}')
+
+        def predicate():
+            return self.coll.count_documents({}) == 2
+
+        wait_until(predicate, "insert 2 documents")
+
+        def predicate():
+            return self.coll.find_one({"_id": 1}) is None
+
+        wait_until(predicate, 'removed {"_id": 1}')
 
 
 class TestBulkAuthorization(BulkAuthorizationTestBase):
     def test_readonly(self):
         # We test that an authorization failure aborts the batch and is raised
         # as OperationFailure.
-        cli = rs_or_single_client_noauth(
+        cli = self.rs_or_single_client_noauth(
             username="readonly", password="pw", authSource="pymongo_test"
         )
         coll = cli.pymongo_test.test
         coll.find_one()
-        self.assertRaises(OperationFailure, coll.bulk_write, [InsertOne({"x": 1})])
+        with self.assertRaises(OperationFailure):
+            coll.bulk_write([InsertOne({"x": 1})])
 
     def test_no_remove(self):
         # We test that an authorization failure aborts the batch and is raised
         # as OperationFailure.
-        cli = rs_or_single_client_noauth(
+        cli = self.rs_or_single_client_noauth(
             username="noremove", password="pw", authSource="pymongo_test"
         )
         coll = cli.pymongo_test.test
@@ -900,7 +918,8 @@ class TestBulkAuthorization(BulkAuthorizationTestBase):
             DeleteMany({}),  # Prohibited.
             InsertOne({"x": 3}),  # Never attempted.
         ]
-        self.assertRaises(OperationFailure, coll.bulk_write, requests)
+        with self.assertRaises(OperationFailure):
+            coll.bulk_write(requests)  # type: ignore[arg-type]
         self.assertEqual({1, 2}, set(self.coll.distinct("x")))
 
 
@@ -908,21 +927,19 @@ class TestBulkWriteConcern(BulkTestBase):
     w: Optional[int]
     secondary: MongoClient
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.w = client_context.w
-        cls.secondary = None
-        if cls.w is not None and cls.w > 1:
-            for member in client_context.hello["hosts"]:
-                if member != client_context.hello["primary"]:
-                    cls.secondary = single_client(*partition_node(member))
+    def setUp(self):
+        super().setUp()
+        self.w = client_context.w
+        self.secondary = None
+        if self.w is not None and self.w > 1:
+            for member in (client_context.hello)["hosts"]:
+                if member != (client_context.hello)["primary"]:
+                    self.secondary = self.single_client(*partition_node(member))
                     break
 
-    @classmethod
-    def tearDownClass(cls):
-        if cls.secondary:
-            cls.secondary.close()
+    def tearDown(self):
+        if self.secondary:
+            self.secondary.close()
 
     def cause_wtimeout(self, requests, ordered):
         if not client_context.test_commands_enabled:
@@ -938,9 +955,12 @@ class TestBulkWriteConcern(BulkTestBase):
         finally:
             self.secondary.admin.command("configureFailPoint", "rsSyncApplyStop", mode="off")
 
+    @client_context.require_version_max(7, 1)  # PYTHON-4560
     @client_context.require_replica_set
     @client_context.require_secondaries_count(1)
     def test_write_concern_failure_ordered(self):
+        details = None
+
         # Ensure we don't raise on wnote.
         coll_ww = self.coll.with_options(write_concern=WriteConcern(w=self.w))
         result = coll_ww.bulk_write([DeleteOne({"something": "that does no exist"})])
@@ -1017,9 +1037,13 @@ class TestBulkWriteConcern(BulkTestBase):
         failed = details["writeErrors"][0]
         self.assertTrue("duplicate" in failed["errmsg"])
 
+    @client_context.require_version_max(7, 1)  # PYTHON-4560
     @client_context.require_replica_set
     @client_context.require_secondaries_count(1)
     def test_write_concern_failure_unordered(self):
+        self.skipTest("Skipping until PYTHON-4865 is resolved.")
+        details = None
+
         # Ensure we don't raise on wnote.
         coll_ww = self.coll.with_options(write_concern=WriteConcern(w=self.w))
         result = coll_ww.bulk_write([DeleteOne({"something": "that does no exist"})], ordered=False)

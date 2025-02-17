@@ -16,18 +16,20 @@
 """Tests for the gridfs package."""
 from __future__ import annotations
 
+import asyncio
 import datetime
 import itertools
 import sys
 import threading
 import time
 from io import BytesIO
+from test.helpers import ConcurrentRunner
 from unittest.mock import patch
 
 sys.path[0:0] = [""]
 
 from test import IntegrationTest, client_context, unittest
-from test.utils import joinall, one, rs_client, rs_or_single_client, single_client
+from test.utils import joinall, one
 
 import gridfs
 from bson.binary import Binary
@@ -41,13 +43,15 @@ from pymongo.errors import (
     ServerSelectionTimeoutError,
     WriteConcernError,
 )
-from pymongo.mongo_client import MongoClient
 from pymongo.read_preferences import ReadPreference
+from pymongo.synchronous.mongo_client import MongoClient
+
+_IS_SYNC = True
 
 
-class JustWrite(threading.Thread):
+class JustWrite(ConcurrentRunner):
     def __init__(self, gfs, num):
-        threading.Thread.__init__(self)
+        super().__init__()
         self.gfs = gfs
         self.num = num
         self.daemon = True
@@ -59,9 +63,9 @@ class JustWrite(threading.Thread):
             file.close()
 
 
-class JustRead(threading.Thread):
+class JustRead(ConcurrentRunner):
     def __init__(self, gfs, num, results):
-        threading.Thread.__init__(self)
+        super().__init__()
         self.gfs = gfs
         self.num = num
         self.results = results
@@ -79,25 +83,23 @@ class TestGridfs(IntegrationTest):
     fs: gridfs.GridFSBucket
     alt: gridfs.GridFSBucket
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.fs = gridfs.GridFSBucket(cls.db)
-        cls.alt = gridfs.GridFSBucket(cls.db, bucket_name="alt")
-
     def setUp(self):
+        super().setUp()
+        self.fs = gridfs.GridFSBucket(self.db)
+        self.alt = gridfs.GridFSBucket(self.db, bucket_name="alt")
         self.cleanup_colls(
             self.db.fs.files, self.db.fs.chunks, self.db.alt.files, self.db.alt.chunks
         )
 
     def test_basic(self):
         oid = self.fs.upload_from_stream("test_filename", b"hello world")
-        self.assertEqual(b"hello world", self.fs.open_download_stream(oid).read())
+        self.assertEqual(b"hello world", (self.fs.open_download_stream(oid)).read())
         self.assertEqual(1, self.db.fs.files.count_documents({}))
         self.assertEqual(1, self.db.fs.chunks.count_documents({}))
 
         self.fs.delete(oid)
-        self.assertRaises(NoFile, self.fs.open_download_stream, oid)
+        with self.assertRaises(NoFile):
+            self.fs.open_download_stream(oid)
         self.assertEqual(0, self.db.fs.files.count_documents({}))
         self.assertEqual(0, self.db.fs.chunks.count_documents({}))
 
@@ -114,7 +116,7 @@ class TestGridfs(IntegrationTest):
 
     def test_empty_file(self):
         oid = self.fs.upload_from_stream("test_filename", b"")
-        self.assertEqual(b"", self.fs.open_download_stream(oid).read())
+        self.assertEqual(b"", (self.fs.open_download_stream(oid)).read())
         self.assertEqual(1, self.db.fs.files.count_documents({}))
         self.assertEqual(0, self.db.fs.chunks.count_documents({}))
 
@@ -131,10 +133,12 @@ class TestGridfs(IntegrationTest):
         self.db.fs.chunks.update_one({"files_id": files_id}, {"$set": {"data": Binary(b"foo", 0)}})
         try:
             out = self.fs.open_download_stream(files_id)
-            self.assertRaises(CorruptGridFile, out.read)
+            with self.assertRaises(CorruptGridFile):
+                out.read()
 
             out = self.fs.open_download_stream(files_id)
-            self.assertRaises(CorruptGridFile, out.readline)
+            with self.assertRaises(CorruptGridFile):
+                out.readline()
         finally:
             self.fs.delete(files_id)
 
@@ -149,13 +153,13 @@ class TestGridfs(IntegrationTest):
         self.assertTrue(
             any(
                 info.get("key") == [("files_id", 1), ("n", 1)]
-                for info in chunks.index_information().values()
+                for info in (chunks.index_information()).values()
             )
         )
         self.assertTrue(
             any(
                 info.get("key") == [("filename", 1), ("uploadDate", 1)]
-                for info in files.index_information().values()
+                for info in (files.index_information()).values()
             )
         )
 
@@ -177,25 +181,27 @@ class TestGridfs(IntegrationTest):
             self.assertTrue(
                 any(
                     info.get("key") == [("filename", 1), ("uploadDate", 1)]
-                    for info in files.index_information().values()
+                    for info in (files.index_information()).values()
                 )
             )
             files.drop()
 
     def test_alt_collection(self):
         oid = self.alt.upload_from_stream("test_filename", b"hello world")
-        self.assertEqual(b"hello world", self.alt.open_download_stream(oid).read())
+        self.assertEqual(b"hello world", (self.alt.open_download_stream(oid)).read())
         self.assertEqual(1, self.db.alt.files.count_documents({}))
         self.assertEqual(1, self.db.alt.chunks.count_documents({}))
 
         self.alt.delete(oid)
-        self.assertRaises(NoFile, self.alt.open_download_stream, oid)
+        with self.assertRaises(NoFile):
+            self.alt.open_download_stream(oid)
         self.assertEqual(0, self.db.alt.files.count_documents({}))
         self.assertEqual(0, self.db.alt.chunks.count_documents({}))
 
-        self.assertRaises(NoFile, self.alt.open_download_stream, "foo")
+        with self.assertRaises(NoFile):
+            self.alt.open_download_stream("foo")
         self.alt.upload_from_stream("foo", b"hello world")
-        self.assertEqual(b"hello world", self.alt.open_download_stream_by_name("foo").read())
+        self.assertEqual(b"hello world", (self.alt.open_download_stream_by_name("foo")).read())
 
         self.alt.upload_from_stream("mike", b"")
         self.alt.upload_from_stream("test", b"foo")
@@ -203,7 +209,7 @@ class TestGridfs(IntegrationTest):
 
         self.assertEqual(
             {"mike", "test", "hello world", "foo"},
-            {k["filename"] for k in list(self.db.alt.files.find())},
+            {k["filename"] for k in self.db.alt.files.find().to_list()},
         )
 
     def test_threaded_reads(self):
@@ -243,13 +249,14 @@ class TestGridfs(IntegrationTest):
         two = two._id
         three = self.fs.upload_from_stream("test", b"baz")
 
-        self.assertEqual(b"baz", self.fs.open_download_stream_by_name("test").read())
+        self.assertEqual(b"baz", (self.fs.open_download_stream_by_name("test")).read())
         self.fs.delete(three)
-        self.assertEqual(b"bar", self.fs.open_download_stream_by_name("test").read())
+        self.assertEqual(b"bar", (self.fs.open_download_stream_by_name("test")).read())
         self.fs.delete(two)
-        self.assertEqual(b"foo", self.fs.open_download_stream_by_name("test").read())
+        self.assertEqual(b"foo", (self.fs.open_download_stream_by_name("test")).read())
         self.fs.delete(one)
-        self.assertRaises(NoFile, self.fs.open_download_stream_by_name, "test")
+        with self.assertRaises(NoFile):
+            self.fs.open_download_stream_by_name("test")
 
     def test_get_version(self):
         self.fs.upload_from_stream("test", b"foo")
@@ -259,30 +266,32 @@ class TestGridfs(IntegrationTest):
         self.fs.upload_from_stream("test", b"baz")
         time.sleep(0.01)
 
-        self.assertEqual(b"foo", self.fs.open_download_stream_by_name("test", revision=0).read())
-        self.assertEqual(b"bar", self.fs.open_download_stream_by_name("test", revision=1).read())
-        self.assertEqual(b"baz", self.fs.open_download_stream_by_name("test", revision=2).read())
+        self.assertEqual(b"foo", (self.fs.open_download_stream_by_name("test", revision=0)).read())
+        self.assertEqual(b"bar", (self.fs.open_download_stream_by_name("test", revision=1)).read())
+        self.assertEqual(b"baz", (self.fs.open_download_stream_by_name("test", revision=2)).read())
 
-        self.assertEqual(b"baz", self.fs.open_download_stream_by_name("test", revision=-1).read())
-        self.assertEqual(b"bar", self.fs.open_download_stream_by_name("test", revision=-2).read())
-        self.assertEqual(b"foo", self.fs.open_download_stream_by_name("test", revision=-3).read())
+        self.assertEqual(b"baz", (self.fs.open_download_stream_by_name("test", revision=-1)).read())
+        self.assertEqual(b"bar", (self.fs.open_download_stream_by_name("test", revision=-2)).read())
+        self.assertEqual(b"foo", (self.fs.open_download_stream_by_name("test", revision=-3)).read())
 
-        self.assertRaises(NoFile, self.fs.open_download_stream_by_name, "test", revision=3)
-        self.assertRaises(NoFile, self.fs.open_download_stream_by_name, "test", revision=-4)
+        with self.assertRaises(NoFile):
+            self.fs.open_download_stream_by_name("test", revision=3)
+        with self.assertRaises(NoFile):
+            self.fs.open_download_stream_by_name("test", revision=-4)
 
     def test_upload_from_stream(self):
         oid = self.fs.upload_from_stream("test_file", BytesIO(b"hello world"), chunk_size_bytes=1)
         self.assertEqual(11, self.db.fs.chunks.count_documents({}))
-        self.assertEqual(b"hello world", self.fs.open_download_stream(oid).read())
+        self.assertEqual(b"hello world", (self.fs.open_download_stream(oid)).read())
 
     def test_upload_from_stream_with_id(self):
         oid = ObjectId()
         self.fs.upload_from_stream_with_id(
             oid, "test_file_custom_id", BytesIO(b"custom id"), chunk_size_bytes=1
         )
-        self.assertEqual(b"custom id", self.fs.open_download_stream(oid).read())
+        self.assertEqual(b"custom id", (self.fs.open_download_stream(oid)).read())
 
-    @patch("gridfs.grid_file._UPLOAD_BUFFER_CHUNKS", 3)
+    @patch("gridfs.synchronous.grid_file._UPLOAD_BUFFER_CHUNKS", 3)
     @client_context.require_failCommand_fail_point
     def test_upload_bulk_write_error(self):
         # Test BulkWriteError from insert_many is converted to an insert_one style error.
@@ -305,7 +314,7 @@ class TestGridfs(IntegrationTest):
         self.assertEqual(3, self.db.fs.chunks.count_documents({"files_id": gin._id}))
         gin.abort()
 
-    @patch("gridfs.grid_file._UPLOAD_BUFFER_CHUNKS", 10)
+    @patch("gridfs.synchronous.grid_file._UPLOAD_BUFFER_CHUNKS", 10)
     def test_upload_batching(self):
         with self.fs.open_upload_stream("test_file", chunk_size_bytes=1) as gin:
             gin.write(b"s" * (10 - 1))
@@ -319,14 +328,14 @@ class TestGridfs(IntegrationTest):
         gin = self.fs.open_upload_stream("from_stream")
         gin.write(b"from stream")
         gin.close()
-        self.assertEqual(b"from stream", self.fs.open_download_stream(gin._id).read())
+        self.assertEqual(b"from stream", (self.fs.open_download_stream(gin._id)).read())
 
     def test_open_upload_stream_with_id(self):
         oid = ObjectId()
         gin = self.fs.open_upload_stream_with_id(oid, "from_stream_custom_id")
         gin.write(b"from stream with custom id")
         gin.close()
-        self.assertEqual(b"from stream with custom id", self.fs.open_download_stream(oid).read())
+        self.assertEqual(b"from stream with custom id", (self.fs.open_download_stream(oid)).read())
 
     def test_missing_length_iter(self):
         # Test fix that guards against PHP-237
@@ -345,15 +354,15 @@ class TestGridfs(IntegrationTest):
         self.assertTrue(iterate_file(fstr))
 
     def test_gridfs_lazy_connect(self):
-        client = MongoClient("badhost", connect=False, serverSelectionTimeoutMS=0)
+        client = self.single_client("badhost", connect=False, serverSelectionTimeoutMS=0)
         cdb = client.db
         gfs = gridfs.GridFSBucket(cdb)
-        self.assertRaises(ServerSelectionTimeoutError, gfs.delete, 0)
+        with self.assertRaises(ServerSelectionTimeoutError):
+            gfs.delete(0)
 
         gfs = gridfs.GridFSBucket(cdb)
-        self.assertRaises(
-            ServerSelectionTimeoutError, gfs.upload_from_stream, "test", b""
-        )  # Still no connection.
+        with self.assertRaises(ServerSelectionTimeoutError):
+            gfs.upload_from_stream("test", b"")  # Still no connection.
 
     def test_gridfs_find(self):
         self.fs.upload_from_stream("two", b"test2")
@@ -369,14 +378,15 @@ class TestGridfs(IntegrationTest):
         cursor = self.fs.find(
             {}, no_cursor_timeout=False, sort=[("uploadDate", -1)], skip=1, limit=2
         )
-        gout = next(cursor)
+        gout = cursor.next()
         self.assertEqual(b"test1", gout.read())
         cursor.rewind()
-        gout = next(cursor)
+        gout = cursor.next()
         self.assertEqual(b"test1", gout.read())
-        gout = next(cursor)
+        gout = cursor.next()
         self.assertEqual(b"test2+", gout.read())
-        self.assertRaises(StopIteration, cursor.__next__)
+        with self.assertRaises(StopIteration):
+            cursor.next()
         cursor.close()
         self.assertRaises(TypeError, self.fs.find, {}, {"_id": True})
 
@@ -386,22 +396,23 @@ class TestGridfs(IntegrationTest):
         self.fs.upload_from_stream("f", data)
         self.db.fs.files.update_one({"filename": "f"}, {"$set": {"chunkSize": 100.0}})
 
-        self.assertEqual(data, self.fs.open_download_stream_by_name("f").read())
+        self.assertEqual(data, (self.fs.open_download_stream_by_name("f")).read())
 
     def test_unacknowledged(self):
         # w=0 is prohibited.
         with self.assertRaises(ConfigurationError):
-            gridfs.GridFSBucket(rs_or_single_client(w=0).pymongo_test)
+            gridfs.GridFSBucket((self.rs_or_single_client(w=0)).pymongo_test)
 
     def test_rename(self):
         _id = self.fs.upload_from_stream("first_name", b"testing")
-        self.assertEqual(b"testing", self.fs.open_download_stream_by_name("first_name").read())
+        self.assertEqual(b"testing", (self.fs.open_download_stream_by_name("first_name")).read())
 
         self.fs.rename(_id, "second_name")
-        self.assertRaises(NoFile, self.fs.open_download_stream_by_name, "first_name")
-        self.assertEqual(b"testing", self.fs.open_download_stream_by_name("second_name").read())
+        with self.assertRaises(NoFile):
+            self.fs.open_download_stream_by_name("first_name")
+        self.assertEqual(b"testing", (self.fs.open_download_stream_by_name("second_name")).read())
 
-    @patch("gridfs.grid_file._UPLOAD_BUFFER_SIZE", 5)
+    @patch("gridfs.synchronous.grid_file._UPLOAD_BUFFER_SIZE", 5)
     def test_abort(self):
         gin = self.fs.open_upload_stream("test_filename", chunk_size_bytes=5)
         gin.write(b"test1")
@@ -410,7 +421,8 @@ class TestGridfs(IntegrationTest):
         self.assertEqual(3, self.db.fs.chunks.count_documents({"files_id": gin._id}))
         gin.abort()
         self.assertTrue(gin.closed)
-        self.assertRaises(ValueError, gin.write, b"test4")
+        with self.assertRaises(ValueError):
+            gin.write(b"test4")
         self.assertEqual(0, self.db.fs.chunks.count_documents({"files_id": gin._id}))
 
     def test_download_to_stream(self):
@@ -479,26 +491,26 @@ class TestGridfs(IntegrationTest):
 
 
 class TestGridfsBucketReplicaSet(IntegrationTest):
-    @classmethod
     @client_context.require_secondaries_count(1)
-    def setUpClass(cls):
-        super().setUpClass()
+    def setUp(self):
+        super().setUp()
 
     @classmethod
+    @client_context.require_connection
     def tearDownClass(cls):
         client_context.client.drop_database("gfsbucketreplica")
 
     def test_gridfs_replica_set(self):
-        rsc = rs_client(w=client_context.w, read_preference=ReadPreference.SECONDARY)
+        rsc = self.rs_client(w=client_context.w, read_preference=ReadPreference.SECONDARY)
 
         gfs = gridfs.GridFSBucket(rsc.gfsbucketreplica, "gfsbucketreplicatest")
         oid = gfs.upload_from_stream("test_filename", b"foo")
-        content = gfs.open_download_stream(oid).read()
+        content = (gfs.open_download_stream(oid)).read()
         self.assertEqual(b"foo", content)
 
     def test_gridfs_secondary(self):
         secondary_host, secondary_port = one(self.client.secondaries)
-        secondary_connection = single_client(
+        secondary_connection = self.single_client(
             secondary_host, secondary_port, read_preference=ReadPreference.SECONDARY
         )
 
@@ -507,13 +519,14 @@ class TestGridfsBucketReplicaSet(IntegrationTest):
         gfs = gridfs.GridFSBucket(secondary_connection.gfsbucketreplica, "gfsbucketsecondarytest")
 
         # This won't detect secondary, raises error
-        self.assertRaises(NotPrimaryError, gfs.upload_from_stream, "test_filename", b"foo")
+        with self.assertRaises(NotPrimaryError):
+            gfs.upload_from_stream("test_filename", b"foo")
 
     def test_gridfs_secondary_lazy(self):
         # Should detect it's connected to secondary and not attempt to
         # create index.
         secondary_host, secondary_port = one(self.client.secondaries)
-        client = single_client(
+        client = self.single_client(
             secondary_host, secondary_port, read_preference=ReadPreference.SECONDARY, connect=False
         )
 
@@ -521,8 +534,10 @@ class TestGridfsBucketReplicaSet(IntegrationTest):
         gfs = gridfs.GridFSBucket(client.gfsbucketreplica, "gfsbucketsecondarylazytest")
 
         # Connects, doesn't create index.
-        self.assertRaises(NoFile, gfs.open_download_stream_by_name, "test_filename")
-        self.assertRaises(NotPrimaryError, gfs.upload_from_stream, "test_filename", b"data")
+        with self.assertRaises(NoFile):
+            gfs.open_download_stream_by_name("test_filename")
+        with self.assertRaises(NotPrimaryError):
+            gfs.upload_from_stream("test_filename", b"data")
 
 
 if __name__ == "__main__":

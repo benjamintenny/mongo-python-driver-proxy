@@ -142,7 +142,6 @@ class TestURI(unittest.TestCase):
         self.assertEqual({"fsync": True}, split_options("fsync=true"))
         self.assertEqual({"fsync": False}, split_options("fsync=false"))
         self.assertEqual({"authmechanism": "GSSAPI"}, split_options("authMechanism=GSSAPI"))
-        self.assertEqual({"authmechanism": "MONGODB-CR"}, split_options("authMechanism=MONGODB-CR"))
         self.assertEqual(
             {"authmechanism": "SCRAM-SHA-1"}, split_options("authMechanism=SCRAM-SHA-1")
         )
@@ -159,10 +158,6 @@ class TestURI(unittest.TestCase):
         self.assertRaises(InvalidURI, parse_uri, "http://foobar.com")
         self.assertRaises(InvalidURI, parse_uri, "http://foo@foobar.com")
         self.assertRaises(ValueError, parse_uri, "mongodb://::1", 27017)
-
-        # Extra whitespace should be visible in error message.
-        with self.assertRaisesRegex(ValueError, "'27017 '"):
-            parse_uri("mongodb://localhost:27017 ")
 
         orig: dict = {
             "nodelist": [("localhost", 27017)],
@@ -299,30 +294,30 @@ class TestURI(unittest.TestCase):
 
         # Various authentication tests
         res = copy.deepcopy(orig)
-        res["options"] = {"authmechanism": "MONGODB-CR"}
+        res["options"] = {"authmechanism": "SCRAM-SHA-256"}
         res["username"] = "user"
         res["password"] = "password"
         self.assertEqual(
-            res, parse_uri("mongodb://user:password@localhost/?authMechanism=MONGODB-CR")
+            res, parse_uri("mongodb://user:password@localhost/?authMechanism=SCRAM-SHA-256")
         )
 
         res = copy.deepcopy(orig)
-        res["options"] = {"authmechanism": "MONGODB-CR", "authsource": "bar"}
+        res["options"] = {"authmechanism": "SCRAM-SHA-256", "authsource": "bar"}
         res["username"] = "user"
         res["password"] = "password"
         res["database"] = "foo"
         self.assertEqual(
             res,
             parse_uri(
-                "mongodb://user:password@localhost/foo?authSource=bar;authMechanism=MONGODB-CR"
+                "mongodb://user:password@localhost/foo?authSource=bar;authMechanism=SCRAM-SHA-256"
             ),
         )
 
         res = copy.deepcopy(orig)
-        res["options"] = {"authmechanism": "MONGODB-CR"}
+        res["options"] = {"authmechanism": "SCRAM-SHA-256"}
         res["username"] = "user"
         res["password"] = ""
-        self.assertEqual(res, parse_uri("mongodb://user:@localhost/?authMechanism=MONGODB-CR"))
+        self.assertEqual(res, parse_uri("mongodb://user:@localhost/?authMechanism=SCRAM-SHA-256"))
 
         res = copy.deepcopy(orig)
         res["username"] = "user@domain.com"
@@ -474,9 +469,9 @@ class TestURI(unittest.TestCase):
         res = {"tls": True, "appname": "myapp"}
         self.assertEqual(res, parse_uri(uri)["options"])
 
-    def test_unquote_after_parsing(self):
-        quoted_val = "val%21%40%23%24%25%5E%26%2A%28%29_%2B%2C%3A+etc"
-        unquoted_val = "val!@#$%^&*()_+,: etc"
+    def test_unquote_during_parsing(self):
+        quoted_val = "val%21%40%23%24%25%5E%26%2A%28%29_%2B%3A+etc"
+        unquoted_val = "val!@#$%^&*()_+: etc"
         uri = (
             "mongodb://user:password@localhost/?authMechanism=MONGODB-AWS"
             "&authMechanismProperties=AWS_SESSION_TOKEN:" + quoted_val
@@ -511,7 +506,7 @@ class TestURI(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ValueError,
-            "auth mechanism properties must be key:value pairs like AWS_SESSION_TOKEN:<token>",
+            "Malformed auth mechanism properties",
         ):
             parse_uri(uri)
 
@@ -535,6 +530,28 @@ class TestURI(unittest.TestCase):
         res = parse_uri(uri)
         self.assertEqual(user, res["username"])
         self.assertEqual(pwd, res["password"])
+
+    def test_do_not_include_password_in_port_message(self):
+        with self.assertRaisesRegex(ValueError, "Port must be an integer between 0 and 65535"):
+            parse_uri("mongodb://localhost:65536")
+        with self.assertRaisesRegex(
+            ValueError, "Port contains non-digit characters. Hint: username "
+        ) as ctx:
+            parse_uri("mongodb://user:PASS /@localhost:27017")
+        self.assertNotIn("PASS", str(ctx.exception))
+
+        # This "invalid" case is technically a valid URI:
+        res = parse_uri("mongodb://user:1234/@localhost:27017")
+        self.assertEqual([("user", 1234)], res["nodelist"])
+        self.assertEqual("@localhost:27017", res["database"])
+
+    def test_port_with_whitespace(self):
+        with self.assertRaisesRegex(ValueError, "Port contains whitespace character: ' '"):
+            parse_uri("mongodb://localhost:27017 ")
+        with self.assertRaisesRegex(ValueError, "Port contains whitespace character: ' '"):
+            parse_uri("mongodb://localhost: 27017")
+        with self.assertRaisesRegex(ValueError, r"Port contains whitespace character: '\\n'"):
+            parse_uri("mongodb://localhost:27\n017")
 
 
 if __name__ == "__main__":

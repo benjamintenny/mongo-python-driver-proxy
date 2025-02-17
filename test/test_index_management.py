@@ -15,25 +15,36 @@
 """Run the auth spec tests."""
 from __future__ import annotations
 
+import asyncio
 import os
+import pathlib
 import sys
 import time
 import uuid
 from typing import Any, Mapping
 
+import pytest
+
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, unittest
+from test import IntegrationTest, PyMongoTestCase, unittest
 from test.unified_format import generate_test_classes
-from test.utils import AllowListEventListener, EventListener
+from test.utils import AllowListEventListener, OvertCommandListener
 
-from pymongo import MongoClient
 from pymongo.errors import OperationFailure
 from pymongo.operations import SearchIndexModel
 from pymongo.read_concern import ReadConcern
 from pymongo.write_concern import WriteConcern
 
-_TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "index_management")
+_IS_SYNC = True
+
+pytestmark = pytest.mark.index_management
+
+# Location of JSON test specifications.
+if _IS_SYNC:
+    _TEST_PATH = os.path.join(pathlib.Path(__file__).resolve().parent, "index_management")
+else:
+    _TEST_PATH = os.path.join(pathlib.Path(__file__).resolve().parent.parent, "index_management")
 
 _NAME = "test-search-index"
 
@@ -43,8 +54,7 @@ class TestCreateSearchIndex(IntegrationTest):
         if not os.environ.get("TEST_INDEX_MANAGEMENT"):
             raise unittest.SkipTest("Skipping index management tests")
         listener = AllowListEventListener("createSearchIndexes")
-        client = MongoClient(event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.simple_client(event_listeners=[listener])
         coll = client.test.test
         coll.drop()
         definition = dict(mappings=dict(dynamic=True))
@@ -75,28 +85,30 @@ class TestCreateSearchIndex(IntegrationTest):
         )
 
 
-class SearchIndexIntegrationBase(unittest.TestCase):
+class SearchIndexIntegrationBase(PyMongoTestCase):
     db_name = "test_search_index_base"
 
     @classmethod
     def setUpClass(cls) -> None:
-        super().setUpClass()
         if not os.environ.get("TEST_INDEX_MANAGEMENT"):
             raise unittest.SkipTest("Skipping index management tests")
-        url = os.environ.get("MONGODB_URI")
-        username = os.environ["DB_USER"]
-        password = os.environ["DB_PASSWORD"]
-        cls.listener = listener = EventListener()
-        cls.client = MongoClient(
-            url, username=username, password=password, event_listeners=[listener]
-        )
-        cls.client.drop_database(_NAME)
-        cls.db = cls.client[cls.db_name]
+        cls.url = os.environ.get("MONGODB_URI")
+        cls.username = os.environ["DB_USER"]
+        cls.password = os.environ["DB_PASSWORD"]
+        cls.listener = OvertCommandListener()
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.client.drop_database(_NAME)
-        cls.client.close()
+    def setUp(self) -> None:
+        self.client = self.simple_client(
+            self.url,
+            username=self.username,
+            password=self.password,
+            event_listeners=[self.listener],
+        )
+        self.client.drop_database(_NAME)
+        self.db = self.client[self.db_name]
+
+    def tearDown(self):
+        self.client.drop_database(_NAME)
 
     def wait_for_ready(self, coll, name=_NAME, predicate=None):
         """Wait for a search index to be ready."""
@@ -105,10 +117,9 @@ class SearchIndexIntegrationBase(unittest.TestCase):
             predicate = lambda index: index.get("queryable") is True
 
         while True:
-            indices = list(coll.list_search_indexes(name))
+            indices = (coll.list_search_indexes(name)).to_list()
             if len(indices) and predicate(indices[0]):
                 return indices[0]
-                break
             time.sleep(5)
 
 
@@ -131,7 +142,7 @@ class TestSearchIndexIntegration(SearchIndexIntegrationBase):
 
         # Get the index definition.
         self.listener.reset()
-        coll0.list_search_indexes(name=implicit_search_resp, comment="foo").next()
+        (coll0.list_search_indexes(name=implicit_search_resp, comment="foo")).next()
         event = self.listener.events[0]
         self.assertEqual(event.command["comment"], "foo")
 
@@ -181,7 +192,7 @@ class TestSearchIndexProse(SearchIndexIntegrationBase):
         )
 
         # .Assert that the command returns an array containing the new indexes' names: ``["test-search-index-1", "test-search-index-2"]``.
-        indices = list(coll0.list_search_indexes())
+        indices = (coll0.list_search_indexes()).to_list()
         names = [i["name"] for i in indices]
         self.assertIn(name1, names)
         self.assertIn(name2, names)
@@ -221,7 +232,7 @@ class TestSearchIndexProse(SearchIndexIntegrationBase):
         # Run ``coll0.listSearchIndexes()`` repeatedly every 5 seconds until ``listSearchIndexes`` returns an empty array.
         t0 = time.time()
         while True:
-            indices = list(coll0.list_search_indexes())
+            indices = (coll0.list_search_indexes()).to_list()
             if indices:
                 break
             if (time.time() - t0) / 60 > 5:
@@ -257,7 +268,7 @@ class TestSearchIndexProse(SearchIndexIntegrationBase):
         self.wait_for_ready(coll0, predicate=predicate)
 
         # Assert that an index is present with the name ``test-search-index`` and the definition has a property ``latestDefinition`` whose value is ``{ 'mappings': { 'dynamic': true } }``.
-        index = list(coll0.list_search_indexes(_NAME))[0]
+        index = ((coll0.list_search_indexes(_NAME)).to_list())[0]
         self.assertIn("latestDefinition", index)
         self.assertEqual(index["latestDefinition"], model2["definition"])
 
@@ -322,7 +333,7 @@ class TestSearchIndexProse(SearchIndexIntegrationBase):
         )
 
         # Get the index definition.
-        resp = coll0.list_search_indexes(name=implicit_search_resp).next()
+        resp = (coll0.list_search_indexes(name=implicit_search_resp)).next()
 
         # Assert that the index model contains the correct index type: ``"search"``.
         self.assertEqual(resp["type"], "search")
@@ -333,7 +344,7 @@ class TestSearchIndexProse(SearchIndexIntegrationBase):
         )
 
         # Get the index definition.
-        resp = coll0.list_search_indexes(name=explicit_search_resp).next()
+        resp = (coll0.list_search_indexes(name=explicit_search_resp)).next()
 
         # Assert that the index model contains the correct index type: ``"search"``.
         self.assertEqual(resp["type"], "search")
@@ -348,7 +359,7 @@ class TestSearchIndexProse(SearchIndexIntegrationBase):
         )
 
         # Get the index definition.
-        resp = coll0.list_search_indexes(name=explicit_vector_resp).next()
+        resp = (coll0.list_search_indexes(name=explicit_vector_resp)).next()
 
         # Assert that the index model contains the correct index type: ``"vectorSearch"``.
         self.assertEqual(resp["type"], "vectorSearch")

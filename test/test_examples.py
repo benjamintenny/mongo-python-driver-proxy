@@ -15,37 +15,39 @@
 """MongoDB documentation examples in Python."""
 from __future__ import annotations
 
+import asyncio
 import datetime
+import functools
 import sys
 import threading
+import time
+from test.helpers import ConcurrentRunner
 
 sys.path[0:0] = [""]
 
 from test import IntegrationTest, client_context, unittest
-from test.utils import rs_client, wait_until
+from test.utils import wait_until
 
 import pymongo
 from pymongo.errors import ConnectionFailure, OperationFailure
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference
 from pymongo.server_api import ServerApi
+from pymongo.synchronous.helpers import next
 from pymongo.write_concern import WriteConcern
+
+_IS_SYNC = True
 
 
 class TestSampleShellCommands(IntegrationTest):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        # Run once before any tests run.
-        cls.db.inventory.drop()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.client.drop_database("pymongo_test")
+    def setUp(self):
+        super().setUp()
+        self.db.inventory.drop()
 
     def tearDown(self):
         # Run after every test.
         self.db.inventory.drop()
+        self.client.drop_database("pymongo_test")
 
     def test_first_three_examples(self):
         db = self.db
@@ -67,7 +69,7 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({"item": "canvas"})
         # End Example 2
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 3
         db.inventory.insert_many(
@@ -142,31 +144,31 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({})
         # End Example 7
 
-        self.assertEqual(len(list(cursor)), 5)
+        self.assertEqual(len(cursor.to_list()), 5)
 
         # Start Example 9
         cursor = db.inventory.find({"status": "D"})
         # End Example 9
 
-        self.assertEqual(len(list(cursor)), 2)
+        self.assertEqual(len(cursor.to_list()), 2)
 
         # Start Example 10
         cursor = db.inventory.find({"status": {"$in": ["A", "D"]}})
         # End Example 10
 
-        self.assertEqual(len(list(cursor)), 5)
+        self.assertEqual(len(cursor.to_list()), 5)
 
         # Start Example 11
         cursor = db.inventory.find({"status": "A", "qty": {"$lt": 30}})
         # End Example 11
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 12
         cursor = db.inventory.find({"$or": [{"status": "A"}, {"qty": {"$lt": 30}}]})
         # End Example 12
 
-        self.assertEqual(len(list(cursor)), 3)
+        self.assertEqual(len(cursor.to_list()), 3)
 
         # Start Example 13
         cursor = db.inventory.find(
@@ -174,7 +176,7 @@ class TestSampleShellCommands(IntegrationTest):
         )
         # End Example 13
 
-        self.assertEqual(len(list(cursor)), 2)
+        self.assertEqual(len(cursor.to_list()), 2)
 
     def test_query_embedded_documents(self):
         db = self.db
@@ -224,31 +226,31 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({"size": SON([("h", 14), ("w", 21), ("uom", "cm")])})
         # End Example 15
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 16
         cursor = db.inventory.find({"size": SON([("w", 21), ("h", 14), ("uom", "cm")])})
         # End Example 16
 
-        self.assertEqual(len(list(cursor)), 0)
+        self.assertEqual(len(cursor.to_list()), 0)
 
         # Start Example 17
         cursor = db.inventory.find({"size.uom": "in"})
         # End Example 17
 
-        self.assertEqual(len(list(cursor)), 2)
+        self.assertEqual(len(cursor.to_list()), 2)
 
         # Start Example 18
         cursor = db.inventory.find({"size.h": {"$lt": 15}})
         # End Example 18
 
-        self.assertEqual(len(list(cursor)), 4)
+        self.assertEqual(len(cursor.to_list()), 4)
 
         # Start Example 19
         cursor = db.inventory.find({"size.h": {"$lt": 15}, "size.uom": "in", "status": "D"})
         # End Example 19
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
     def test_query_arrays(self):
         db = self.db
@@ -274,49 +276,49 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({"tags": ["red", "blank"]})
         # End Example 21
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 22
         cursor = db.inventory.find({"tags": {"$all": ["red", "blank"]}})
         # End Example 22
 
-        self.assertEqual(len(list(cursor)), 4)
+        self.assertEqual(len(cursor.to_list()), 4)
 
         # Start Example 23
         cursor = db.inventory.find({"tags": "red"})
         # End Example 23
 
-        self.assertEqual(len(list(cursor)), 4)
+        self.assertEqual(len(cursor.to_list()), 4)
 
         # Start Example 24
         cursor = db.inventory.find({"dim_cm": {"$gt": 25}})
         # End Example 24
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 25
         cursor = db.inventory.find({"dim_cm": {"$gt": 15, "$lt": 20}})
         # End Example 25
 
-        self.assertEqual(len(list(cursor)), 4)
+        self.assertEqual(len(cursor.to_list()), 4)
 
         # Start Example 26
         cursor = db.inventory.find({"dim_cm": {"$elemMatch": {"$gt": 22, "$lt": 30}}})
         # End Example 26
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 27
         cursor = db.inventory.find({"dim_cm.1": {"$gt": 25}})
         # End Example 27
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 28
         cursor = db.inventory.find({"tags": {"$size": 3}})
         # End Example 28
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
     def test_query_array_of_documents(self):
         db = self.db
@@ -365,49 +367,49 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({"instock": SON([("warehouse", "A"), ("qty", 5)])})
         # End Example 30
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 31
         cursor = db.inventory.find({"instock": SON([("qty", 5), ("warehouse", "A")])})
         # End Example 31
 
-        self.assertEqual(len(list(cursor)), 0)
+        self.assertEqual(len(cursor.to_list()), 0)
 
         # Start Example 32
         cursor = db.inventory.find({"instock.0.qty": {"$lte": 20}})
         # End Example 32
 
-        self.assertEqual(len(list(cursor)), 3)
+        self.assertEqual(len(cursor.to_list()), 3)
 
         # Start Example 33
         cursor = db.inventory.find({"instock.qty": {"$lte": 20}})
         # End Example 33
 
-        self.assertEqual(len(list(cursor)), 5)
+        self.assertEqual(len(cursor.to_list()), 5)
 
         # Start Example 34
         cursor = db.inventory.find({"instock": {"$elemMatch": {"qty": 5, "warehouse": "A"}}})
         # End Example 34
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 35
         cursor = db.inventory.find({"instock": {"$elemMatch": {"qty": {"$gt": 10, "$lte": 20}}}})
         # End Example 35
 
-        self.assertEqual(len(list(cursor)), 3)
+        self.assertEqual(len(cursor.to_list()), 3)
 
         # Start Example 36
         cursor = db.inventory.find({"instock.qty": {"$gt": 10, "$lte": 20}})
         # End Example 36
 
-        self.assertEqual(len(list(cursor)), 4)
+        self.assertEqual(len(cursor.to_list()), 4)
 
         # Start Example 37
         cursor = db.inventory.find({"instock.qty": 5, "instock.warehouse": "A"})
         # End Example 37
 
-        self.assertEqual(len(list(cursor)), 2)
+        self.assertEqual(len(cursor.to_list()), 2)
 
     def test_query_null(self):
         db = self.db
@@ -420,19 +422,19 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({"item": None})
         # End Example 39
 
-        self.assertEqual(len(list(cursor)), 2)
+        self.assertEqual(len(cursor.to_list()), 2)
 
         # Start Example 40
         cursor = db.inventory.find({"item": {"$type": 10}})
         # End Example 40
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
         # Start Example 41
         cursor = db.inventory.find({"item": {"$exists": False}})
         # End Example 41
 
-        self.assertEqual(len(list(cursor)), 1)
+        self.assertEqual(len(cursor.to_list()), 1)
 
     def test_projection(self):
         db = self.db
@@ -478,7 +480,7 @@ class TestSampleShellCommands(IntegrationTest):
         cursor = db.inventory.find({"status": "A"})
         # End Example 43
 
-        self.assertEqual(len(list(cursor)), 3)
+        self.assertEqual(len(cursor.to_list()), 3)
 
         # Start Example 44
         cursor = db.inventory.find({"status": "A"}, {"item": 1, "status": 1})
@@ -747,11 +749,13 @@ class TestSampleShellCommands(IntegrationTest):
         done = False
 
         def insert_docs():
+            nonlocal done
             while not done:
                 db.inventory.insert_one({"username": "alice"})
                 db.inventory.delete_one({"username": "alice"})
+                time.sleep(0.005)
 
-        t = threading.Thread(target=insert_docs)
+        t = ConcurrentRunner(target=insert_docs)
         t.start()
 
         try:
@@ -760,17 +764,20 @@ class TestSampleShellCommands(IntegrationTest):
             cursor = db.inventory.watch()
             next(cursor)
             # End Changestream Example 1
+            cursor.close()
 
             # Start Changestream Example 2
             cursor = db.inventory.watch(full_document="updateLookup")
             next(cursor)
             # End Changestream Example 2
+            cursor.close()
 
             # Start Changestream Example 3
             resume_token = cursor.resume_token
             cursor = db.inventory.watch(resume_after=resume_token)
             next(cursor)
             # End Changestream Example 3
+            cursor.close()
 
             # Start Changestream Example 4
             pipeline = [
@@ -780,6 +787,7 @@ class TestSampleShellCommands(IntegrationTest):
             cursor = db.inventory.watch(pipeline=pipeline)
             next(cursor)
             # End Changestream Example 4
+            cursor.close()
         finally:
             done = True
             t.join()
@@ -860,6 +868,38 @@ class TestSampleShellCommands(IntegrationTest):
             ]
         )
         # End Aggregation Example 4
+
+    @client_context.require_version_min(4, 4)
+    def test_aggregate_projection_example(self):
+        db = self.db
+
+        # Start Aggregation Projection Example 1
+        db.inventory.find(
+            {},
+            {
+                "_id": 0,
+                "item": 1,
+                "status": {
+                    "$switch": {
+                        "branches": [
+                            {"case": {"$eq": ["$status", "A"]}, "then": "Available"},
+                            {"case": {"$eq": ["$status", "D"]}, "then": "Discontinued"},
+                        ],
+                        "default": "No status found",
+                    }
+                },
+                "area": {
+                    "$concat": [
+                        {"$toString": {"$multiply": ["$size.h", "$size.w"]}},
+                        " ",
+                        "$size.uom",
+                    ]
+                },
+                "reportNumber": {"$literal": 1},
+            },
+        )
+
+        # End Aggregation Projection Example 1
 
     def test_commands(self):
         db = self.db
@@ -1091,7 +1131,7 @@ class TestTransactionExamples(IntegrationTest):
         self.assertEqual(employee["status"], "Inactive")
 
         def MongoClient(_):
-            return rs_client()
+            return self.rs_client()
 
         uriString = None
 
@@ -1183,7 +1223,7 @@ class TestVersionedApiExamples(IntegrationTest):
     def test_versioned_api(self):
         # Versioned API examples
         def MongoClient(_, server_api):
-            return rs_client(server_api=server_api, connect=False)
+            return self.rs_client(server_api=server_api, connect=False)
 
         uri = None
 
@@ -1214,7 +1254,7 @@ class TestVersionedApiExamples(IntegrationTest):
         ):
             self.skipTest("This test needs MongoDB 5.0.2 or newer")
 
-        client = rs_client(server_api=ServerApi("1", strict=True))
+        client = self.rs_client(server_api=ServerApi("1", strict=True))
         client.db.sales.drop()
 
         # Start Versioned API Example 5
@@ -1315,20 +1355,37 @@ class TestSnapshotQueryExamples(IntegrationTest):
         db.drop_collection("dogs")
         db.cats.insert_one({"name": "Whiskers", "color": "white", "age": 10, "adoptable": True})
         db.dogs.insert_one({"name": "Pebbles", "color": "Brown", "age": 10, "adoptable": True})
-        wait_until(lambda: self.check_for_snapshot(db.cats), "success")
-        wait_until(lambda: self.check_for_snapshot(db.dogs), "success")
+
+        def predicate_one():
+            return self.check_for_snapshot(db.cats)
+
+        def predicate_two():
+            return self.check_for_snapshot(db.dogs)
+
+        wait_until(predicate_two, "success")
+        wait_until(predicate_one, "success")
 
         # Start Snapshot Query Example 1
 
         db = client.pets
         with client.start_session(snapshot=True) as s:
-            adoptablePetsCount = db.cats.aggregate(
-                [{"$match": {"adoptable": True}}, {"$count": "adoptableCatsCount"}], session=s
-            ).next()["adoptableCatsCount"]
+            adoptablePetsCount = (
+                (
+                    db.cats.aggregate(
+                        [{"$match": {"adoptable": True}}, {"$count": "adoptableCatsCount"}],
+                        session=s,
+                    )
+                ).next()
+            )["adoptableCatsCount"]
 
-            adoptablePetsCount += db.dogs.aggregate(
-                [{"$match": {"adoptable": True}}, {"$count": "adoptableDogsCount"}], session=s
-            ).next()["adoptableDogsCount"]
+            adoptablePetsCount += (
+                (
+                    db.dogs.aggregate(
+                        [{"$match": {"adoptable": True}}, {"$count": "adoptableDogsCount"}],
+                        session=s,
+                    )
+                ).next()
+            )["adoptableDogsCount"]
 
         print(adoptablePetsCount)
 
@@ -1339,33 +1396,41 @@ class TestSnapshotQueryExamples(IntegrationTest):
 
         saleDate = datetime.datetime.now()
         db.sales.insert_one({"shoeType": "boot", "price": 30, "saleDate": saleDate})
-        wait_until(lambda: self.check_for_snapshot(db.sales), "success")
+
+        def predicate_three():
+            return self.check_for_snapshot(db.sales)
+
+        wait_until(predicate_three, "success")
 
         # Start Snapshot Query Example 2
         db = client.retail
         with client.start_session(snapshot=True) as s:
-            db.sales.aggregate(
-                [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$gt": [
-                                    "$saleDate",
-                                    {
-                                        "$dateSubtract": {
-                                            "startDate": "$$NOW",
-                                            "unit": "day",
-                                            "amount": 1,
-                                        }
-                                    },
-                                ]
-                            }
-                        }
-                    },
-                    {"$count": "totalDailySales"},
-                ],
-                session=s,
-            ).next()["totalDailySales"]
+            _ = (
+                (
+                    db.sales.aggregate(
+                        [
+                            {
+                                "$match": {
+                                    "$expr": {
+                                        "$gt": [
+                                            "$saleDate",
+                                            {
+                                                "$dateSubtract": {
+                                                    "startDate": "$$NOW",
+                                                    "unit": "day",
+                                                    "amount": 1,
+                                                }
+                                            },
+                                        ]
+                                    }
+                                }
+                            },
+                            {"$count": "totalDailySales"},
+                        ],
+                        session=s,
+                    )
+                ).next()
+            )["totalDailySales"]
 
         # End Snapshot Query Example 2
 

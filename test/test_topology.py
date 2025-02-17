@@ -29,15 +29,15 @@ from bson.objectid import ObjectId
 from pymongo import common
 from pymongo.errors import AutoReconnect, ConfigurationError, ConnectionFailure
 from pymongo.hello import Hello, HelloCompat
-from pymongo.monitor import Monitor
-from pymongo.pool import PoolOptions
 from pymongo.read_preferences import ReadPreference, Secondary
-from pymongo.server import Server
 from pymongo.server_description import ServerDescription
 from pymongo.server_selectors import any_server_selector, writable_server_selector
 from pymongo.server_type import SERVER_TYPE
-from pymongo.settings import TopologySettings
-from pymongo.topology import Topology, _ErrorContext, _filter_servers
+from pymongo.synchronous.monitor import Monitor
+from pymongo.synchronous.pool import PoolOptions
+from pymongo.synchronous.server import Server
+from pymongo.synchronous.settings import TopologySettings
+from pymongo.synchronous.topology import Topology, _ErrorContext, _filter_servers
 from pymongo.topology_description import TOPOLOGY_TYPE
 
 
@@ -133,7 +133,7 @@ class TestSingleServerTopology(TopologyTest):
                     HelloCompat.LEGACY_CMD: True,
                     "hosts": ["a"],
                     "setName": "rs",
-                    "maxWireVersion": 6,
+                    "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
                 },
             ),
             (
@@ -144,12 +144,17 @@ class TestSingleServerTopology(TopologyTest):
                     "secondary": True,
                     "hosts": ["a"],
                     "setName": "rs",
-                    "maxWireVersion": 6,
+                    "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
                 },
             ),
             (
                 SERVER_TYPE.Mongos,
-                {"ok": 1, HelloCompat.LEGACY_CMD: True, "msg": "isdbgrid", "maxWireVersion": 6},
+                {
+                    "ok": 1,
+                    HelloCompat.LEGACY_CMD: True,
+                    "msg": "isdbgrid",
+                    "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
+                },
             ),
             (
                 SERVER_TYPE.RSArbiter,
@@ -159,14 +164,28 @@ class TestSingleServerTopology(TopologyTest):
                     "arbiterOnly": True,
                     "hosts": ["a"],
                     "setName": "rs",
-                    "maxWireVersion": 6,
+                    "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
                 },
             ),
-            (SERVER_TYPE.Standalone, {"ok": 1, HelloCompat.LEGACY_CMD: True, "maxWireVersion": 6}),
+            (
+                SERVER_TYPE.Standalone,
+                {
+                    "ok": 1,
+                    HelloCompat.LEGACY_CMD: True,
+                    "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
+                },
+            ),
             # A "slave" in a master-slave deployment.
             # This replication type was removed in MongoDB
             # 4.0.
-            (SERVER_TYPE.Standalone, {"ok": 1, HelloCompat.LEGACY_CMD: False, "maxWireVersion": 6}),
+            (
+                SERVER_TYPE.Standalone,
+                {
+                    "ok": 1,
+                    HelloCompat.LEGACY_CMD: False,
+                    "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
+                },
+            ),
         ]:
             t = create_mock_topology(direct_connection=True)
 
@@ -213,7 +232,10 @@ class TestSingleServerTopology(TopologyTest):
         class TestMonitor(Monitor):
             def _check_with_socket(self, *args, **kwargs):
                 if available:
-                    return (Hello({"ok": 1, "maxWireVersion": 6}), round_trip_time)
+                    return (
+                        Hello({"ok": 1, "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION}),
+                        round_trip_time,
+                    )
                 else:
                     raise AutoReconnect("mock monitor error")
 
@@ -531,12 +553,12 @@ class TestMultiServerTopology(TopologyTest):
                 "setName": "rs",
                 "hosts": ["a"],
                 "minWireVersion": 1,
-                "maxWireVersion": 6,
+                "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
             },
         )
 
         self.assertEqual(server.description.min_wire_version, 1)
-        self.assertEqual(server.description.max_wire_version, 6)
+        self.assertEqual(server.description.max_wire_version, 7)
         t.select_servers(any_server_selector, _Op.TEST)
 
         # Incompatible.
@@ -548,8 +570,8 @@ class TestMultiServerTopology(TopologyTest):
                 HelloCompat.LEGACY_CMD: True,
                 "setName": "rs",
                 "hosts": ["a"],
-                "minWireVersion": 22,
-                "maxWireVersion": 24,
+                "minWireVersion": 26,
+                "maxWireVersion": 27,
             },
         )
 
@@ -559,7 +581,7 @@ class TestMultiServerTopology(TopologyTest):
             # Error message should say which server failed and why.
             self.assertEqual(
                 str(e),
-                "Server at a:27017 requires wire version 22, but this version "
+                "Server at a:27017 requires wire version 26, but this version "
                 "of PyMongo only supports up to %d." % (common.MAX_SUPPORTED_WIRE_VERSION,),
             )
         else:
@@ -607,7 +629,7 @@ class TestMultiServerTopology(TopologyTest):
                 HelloCompat.LEGACY_CMD: True,
                 "setName": "rs",
                 "hosts": ["a", "b"],
-                "maxWireVersion": 6,
+                "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
                 "maxWriteBatchSize": 1,
             },
         )
@@ -621,7 +643,7 @@ class TestMultiServerTopology(TopologyTest):
                 "secondary": True,
                 "setName": "rs",
                 "hosts": ["a", "b"],
-                "maxWireVersion": 6,
+                "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
                 "maxWriteBatchSize": 2,
             },
         )
@@ -638,7 +660,7 @@ class TestMultiServerTopology(TopologyTest):
                 HelloCompat.LEGACY_CMD: True,
                 "setName": "rs",
                 "hosts": ["a", "b"],
-                "maxWireVersion": 6,
+                "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
                 "maxWriteBatchSize": 2,
             },
         )
@@ -735,7 +757,7 @@ class TestTopologyErrors(TopologyTest):
             def _check_with_socket(self, *args, **kwargs):
                 hello_count[0] += 1
                 if hello_count[0] == 1:
-                    return Hello({"ok": 1, "maxWireVersion": 6}), 0
+                    return Hello({"ok": 1, "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION}), 0
                 else:
                     raise AutoReconnect("mock monitor error")
 
@@ -757,7 +779,7 @@ class TestTopologyErrors(TopologyTest):
             def _check_with_socket(self, *args, **kwargs):
                 hello_count[0] += 1
                 if hello_count[0] in (1, 3):
-                    return Hello({"ok": 1, "maxWireVersion": 6}), 0
+                    return Hello({"ok": 1, "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION}), 0
                 else:
                     raise AutoReconnect(f"mock monitor error #{hello_count[0]}")
 

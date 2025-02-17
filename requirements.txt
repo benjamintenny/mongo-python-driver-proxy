@@ -1,2 +1,2 @@
 dnspython>=1.16.0,<3.0.0
-python-socks==2.4.4
+python-socks==2.7.1

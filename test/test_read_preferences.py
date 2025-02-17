@@ -26,13 +26,16 @@ from pymongo.operations import _Op
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, SkipTest, client_context, unittest
+from test import (
+    IntegrationTest,
+    SkipTest,
+    client_context,
+    connected,
+    unittest,
+)
 from test.utils import (
     OvertCommandListener,
-    connected,
     one,
-    rs_client,
-    single_client,
     wait_until,
 )
 from test.version import Version
@@ -40,7 +43,6 @@ from test.version import Version
 from bson.son import SON
 from pymongo.errors import ConfigurationError, OperationFailure
 from pymongo.message import _maybe_add_read_preference
-from pymongo.mongo_client import MongoClient
 from pymongo.read_preferences import (
     MovingAverage,
     Nearest,
@@ -53,15 +55,22 @@ from pymongo.read_preferences import (
 from pymongo.server_description import ServerDescription
 from pymongo.server_selectors import Selection, readable_server_selector
 from pymongo.server_type import SERVER_TYPE
+from pymongo.synchronous.helpers import next
+from pymongo.synchronous.mongo_client import MongoClient
 from pymongo.write_concern import WriteConcern
+
+_IS_SYNC = True
 
 
 class TestSelections(IntegrationTest):
     @client_context.require_connection
     def test_bool(self):
-        client = single_client()
+        client = self.single_client()
 
-        wait_until(lambda: client.address, "discover primary")
+        def predicate():
+            return client.address
+
+        wait_until(predicate, "discover primary")
         selection = Selection.from_topology_description(client._topology.description)
 
         self.assertTrue(selection)
@@ -91,11 +100,7 @@ class TestReadPreferenceObjects(unittest.TestCase):
 
 
 class TestReadPreferencesBase(IntegrationTest):
-    @classmethod
     @client_context.require_secondaries_count(1)
-    def setUpClass(cls):
-        super().setUpClass()
-
     def setUp(self):
         super().setUp()
         # Insert some data so we can use cursors in read_from_which_host
@@ -126,11 +131,14 @@ class TestReadPreferencesBase(IntegrationTest):
                 f"Cursor used address {address}, expected either primary "
                 f"{client.primary} or secondaries {client.secondaries}"
             )
-            return None
 
     def assertReadsFrom(self, expected, **kwargs):
-        c = rs_client(**kwargs)
-        wait_until(lambda: len(c.nodes - c.arbiters) == client_context.w, "discovered all nodes")
+        c = self.rs_client(**kwargs)
+
+        def predicate():
+            return len(c.nodes - c.arbiters) == client_context.w
+
+        wait_until(predicate, "discovered all nodes")
 
         used = self.read_from_which_kind(c)
         self.assertEqual(expected, used, f"Cursor used {used}, expected {expected}")
@@ -140,7 +148,7 @@ class TestSingleSecondaryOk(TestReadPreferencesBase):
     def test_reads_from_secondary(self):
         host, port = next(iter(self.client.secondaries))
         # Direct connection to a secondary.
-        client = single_client(host, port)
+        client = self.single_client(host, port)
         self.assertFalse(client.is_primary)
 
         # Regardless of read preference, we should be able to do
@@ -153,7 +161,7 @@ class TestSingleSecondaryOk(TestReadPreferencesBase):
 
         # Test find and find_one.
         self.assertIsNotNone(coll.find_one())
-        self.assertEqual(10, len(list(coll.find())))
+        self.assertEqual(10, len(coll.find().to_list()))
 
         # Test some database helpers.
         self.assertIsNotNone(db.list_collection_names())
@@ -176,19 +184,23 @@ class TestReadPreferences(TestReadPreferencesBase):
             ReadPreference.SECONDARY_PREFERRED,
             ReadPreference.NEAREST,
         ):
-            self.assertEqual(mode, rs_client(read_preference=mode).read_preference)
+            self.assertEqual(mode, (self.rs_client(read_preference=mode)).read_preference)
 
-        self.assertRaises(TypeError, rs_client, read_preference="foo")
+        with self.assertRaises(TypeError):
+            self.rs_client(read_preference="foo")
 
     def test_tag_sets_validation(self):
         S = Secondary(tag_sets=[{}])
-        self.assertEqual([{}], rs_client(read_preference=S).read_preference.tag_sets)
+        self.assertEqual([{}], (self.rs_client(read_preference=S)).read_preference.tag_sets)
 
         S = Secondary(tag_sets=[{"k": "v"}])
-        self.assertEqual([{"k": "v"}], rs_client(read_preference=S).read_preference.tag_sets)
+        self.assertEqual([{"k": "v"}], (self.rs_client(read_preference=S)).read_preference.tag_sets)
 
         S = Secondary(tag_sets=[{"k": "v"}, {}])
-        self.assertEqual([{"k": "v"}, {}], rs_client(read_preference=S).read_preference.tag_sets)
+        self.assertEqual(
+            [{"k": "v"}, {}],
+            (self.rs_client(read_preference=S)).read_preference.tag_sets,
+        )
 
         self.assertRaises(ValueError, Secondary, tag_sets=[])
 
@@ -201,20 +213,27 @@ class TestReadPreferences(TestReadPreferencesBase):
 
     def test_threshold_validation(self):
         self.assertEqual(
-            17, rs_client(localThresholdMS=17, connect=False).options.local_threshold_ms
+            17,
+            (self.rs_client(localThresholdMS=17, connect=False)).options.local_threshold_ms,
         )
 
         self.assertEqual(
-            42, rs_client(localThresholdMS=42, connect=False).options.local_threshold_ms
+            42,
+            (self.rs_client(localThresholdMS=42, connect=False)).options.local_threshold_ms,
         )
 
         self.assertEqual(
-            666, rs_client(localThresholdMS=666, connect=False).options.local_threshold_ms
+            666,
+            (self.rs_client(localThresholdMS=666, connect=False)).options.local_threshold_ms,
         )
 
-        self.assertEqual(0, rs_client(localThresholdMS=0, connect=False).options.local_threshold_ms)
+        self.assertEqual(
+            0,
+            (self.rs_client(localThresholdMS=0, connect=False)).options.local_threshold_ms,
+        )
 
-        self.assertRaises(ValueError, rs_client, localthresholdms=-1)
+        with self.assertRaises(ValueError):
+            self.rs_client(localthresholdms=-1)
 
     def test_zero_latency(self):
         ping_times: set = set()
@@ -224,7 +243,7 @@ class TestReadPreferences(TestReadPreferencesBase):
         for ping_time, host in zip(ping_times, self.client.nodes):
             ServerDescription._host_to_round_trip_time[host] = ping_time
         try:
-            client = connected(rs_client(readPreference="nearest", localThresholdMS=0))
+            client = connected(self.rs_client(readPreference="nearest", localThresholdMS=0))
             wait_until(lambda: client.nodes == self.client.nodes, "discovered all nodes")
             host = self.read_from_which_host(client)
             for _ in range(5):
@@ -237,7 +256,8 @@ class TestReadPreferences(TestReadPreferencesBase):
 
     def test_primary_with_tags(self):
         # Tags not allowed with PRIMARY
-        self.assertRaises(ConfigurationError, rs_client, tag_sets=[{"dc": "ny"}])
+        with self.assertRaises(ConfigurationError):
+            self.rs_client(tag_sets=[{"dc": "ny"}])
 
     def test_primary_preferred(self):
         self.assertReadsFrom("primary", read_preference=ReadPreference.PRIMARY_PREFERRED)
@@ -251,7 +271,9 @@ class TestReadPreferences(TestReadPreferencesBase):
     def test_nearest(self):
         # With high localThresholdMS, expect to read from any
         # member
-        c = rs_client(read_preference=ReadPreference.NEAREST, localThresholdMS=10000)  # 10 seconds
+        c = self.rs_client(
+            read_preference=ReadPreference.NEAREST, localThresholdMS=10000
+        )  # 10 seconds
 
         data_members = {self.client.primary} | self.client.secondaries
 
@@ -269,7 +291,7 @@ class TestReadPreferences(TestReadPreferencesBase):
         not_used = data_members.difference(used)
         latencies = ", ".join(
             "%s: %sms" % (server.description.address, server.description.round_trip_time)
-            for server in c._get_topology().select_servers(readable_server_selector, _Op.TEST)
+            for server in (c._get_topology()).select_servers(readable_server_selector, _Op.TEST)
         )
 
         self.assertFalse(
@@ -286,12 +308,9 @@ class ReadPrefTester(MongoClient):
         client_options.update(kwargs)
         super().__init__(*args, **client_options)
 
-    @contextlib.contextmanager
     def _conn_for_reads(self, read_preference, session, operation):
         context = super()._conn_for_reads(read_preference, session, operation)
-        with context as (conn, read_preference):
-            self.record_a_read(conn.address)
-            yield conn, read_preference
+        return context
 
     @contextlib.contextmanager
     def _conn_from_server(self, read_preference, server, session):
@@ -301,7 +320,7 @@ class ReadPrefTester(MongoClient):
             yield conn, read_preference
 
     def record_a_read(self, address):
-        server = self._get_topology().select_server_by_address(address, _Op.TEST, 0)
+        server = (self._get_topology()).select_server_by_address(address, _Op.TEST, 0)
         self.has_read_from.add(server)
 
 
@@ -318,25 +337,23 @@ class TestCommandAndReadPreference(IntegrationTest):
     c: ReadPrefTester
     client_version: Version
 
-    @classmethod
     @client_context.require_secondaries_count(1)
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.c = ReadPrefTester(
+    def setUp(self):
+        super().setUp()
+        self.c = ReadPrefTester(
             # Ignore round trip times, to test ReadPreference modes only.
             localThresholdMS=1000 * 1000,
         )
-        cls.client_version = Version.from_client(cls.c)
+        self.client_version = Version.from_client(self.c)
         # mapReduce fails if the collection does not exist.
-        coll = cls.c.pymongo_test.get_collection(
+        coll = self.c.pymongo_test.get_collection(
             "test", write_concern=WriteConcern(w=client_context.w)
         )
         coll.insert_one({})
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.c.drop_database("pymongo_test")
-        cls.c.close()
+    def tearDown(self):
+        self.c.drop_database("pymongo_test")
+        self.c.close()
 
     def executed_on_which_server(self, client, fn, *args, **kwargs):
         """Execute fn(*args, **kwargs) and return the Server instance used."""
@@ -363,7 +380,7 @@ class TestCommandAndReadPreference(IntegrationTest):
                         break
 
                 assert self.c.primary is not None
-                unused = self.c.secondaries.union({self.c.primary}).difference(used)
+                unused = (self.c.secondaries).union({self.c.primary}).difference(used)
                 if unused:
                     self.fail("Some members not used for NEAREST: %s" % (unused))
             else:
@@ -398,11 +415,12 @@ class TestCommandAndReadPreference(IntegrationTest):
     def test_create_collection(self):
         # create_collection runs listCollections on the primary to check if
         # the collection already exists.
-        self._test_primary_helper(
-            lambda: self.c.pymongo_test.create_collection(
+        def func():
+            return self.c.pymongo_test.create_collection(
                 "some_collection%s" % random.randint(0, sys.maxsize)
             )
-        )
+
+        self._test_primary_helper(func)
 
     def test_count_documents(self):
         self._test_coll_helper(True, self.c.pymongo_test.test, "count_documents", {})
@@ -541,8 +559,7 @@ class TestMongosAndReadPreference(IntegrationTest):
         if client_context.supports_secondary_read_pref:
             cases["secondary"] = Secondary
         listener = OvertCommandListener()
-        client = rs_client(event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.rs_client(event_listeners=[listener])
         client.admin.command("ping")
         for _mode, cls in cases.items():
             pref = cls(hedge={"enabled": True})
@@ -642,10 +659,10 @@ class TestMongosAndReadPreference(IntegrationTest):
         # tell what shard member a query ran on.
         for pref in (Primary(), PrimaryPreferred(), Secondary(), SecondaryPreferred(), Nearest()):
             qcoll = coll.with_options(read_preference=pref)
-            results = list(qcoll.find().sort([("_id", 1)]))
+            results = qcoll.find().sort([("_id", 1)]).to_list()
             self.assertEqual(first_id, results[0]["_id"])
             self.assertEqual(last_id, results[-1]["_id"])
-            results = list(qcoll.find().sort([("_id", -1)]))
+            results = qcoll.find().sort([("_id", -1)]).to_list()
             self.assertEqual(first_id, results[-1]["_id"])
             self.assertEqual(last_id, results[0]["_id"])
 
@@ -668,14 +685,14 @@ class TestMongosAndReadPreference(IntegrationTest):
         else:
             self.fail("mongos accepted invalid staleness")
 
-        coll = single_client(
-            readPreference="secondaryPreferred", maxStalenessSeconds=120
+        coll = (
+            self.single_client(readPreference="secondaryPreferred", maxStalenessSeconds=120)
         ).pymongo_test.test
         # No error
         coll.find_one()
 
-        coll = single_client(
-            readPreference="secondaryPreferred", maxStalenessSeconds=10
+        coll = (
+            self.single_client(readPreference="secondaryPreferred", maxStalenessSeconds=10)
         ).pymongo_test.test
         try:
             coll.find_one()

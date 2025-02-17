@@ -19,11 +19,17 @@ import os
 import sys
 import unittest
 from collections import defaultdict
+from test import PyMongoTestCase
+
+import pytest
 
 sys.path[0:0] = [""]
 
 import pymongo
 from pymongo.ssl_support import HAS_SNI
+
+pytestmark = pytest.mark.atlas
+
 
 URIS = {
     "ATLAS_REPL": os.environ.get("ATLAS_REPL"),
@@ -41,38 +47,37 @@ URIS = {
 }
 
 
-def connect(uri):
-    if not uri:
-        raise Exception("Must set env variable to test.")
-    client = pymongo.MongoClient(uri)
-    # No TLS error
-    client.admin.command("ping")
-    # No auth error
-    client.test.test.count_documents({})
+class TestAtlasConnect(PyMongoTestCase):
+    def connect(self, uri):
+        if not uri:
+            raise Exception("Must set env variable to test.")
+        client = self.simple_client(uri)
+        # No TLS error
+        client.admin.command("ping")
+        # No auth error
+        client.test.test.count_documents({})
 
-
-class TestAtlasConnect(unittest.TestCase):
     @unittest.skipUnless(HAS_SNI, "Free tier requires SNI support")
     def test_free_tier(self):
-        connect(URIS["ATLAS_FREE"])
+        self.connect(URIS["ATLAS_FREE"])
 
     def test_replica_set(self):
-        connect(URIS["ATLAS_REPL"])
+        self.connect(URIS["ATLAS_REPL"])
 
     def test_sharded_cluster(self):
-        connect(URIS["ATLAS_SHRD"])
+        self.connect(URIS["ATLAS_SHRD"])
 
     def test_tls_11(self):
-        connect(URIS["ATLAS_TLS11"])
+        self.connect(URIS["ATLAS_TLS11"])
 
     def test_tls_12(self):
-        connect(URIS["ATLAS_TLS12"])
+        self.connect(URIS["ATLAS_TLS12"])
 
     def test_serverless(self):
-        connect(URIS["ATLAS_SERVERLESS"])
+        self.connect(URIS["ATLAS_SERVERLESS"])
 
     def connect_srv(self, uri):
-        connect(uri)
+        self.connect(uri)
         self.assertIn("mongodb+srv://", uri)
 
     @unittest.skipUnless(HAS_SNI, "Free tier requires SNI support")

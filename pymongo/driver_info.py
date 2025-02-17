@@ -12,7 +12,10 @@
 # implied.  See the License for the specific language governing
 # permissions and limitations under the License.
 
-"""Advanced options for MongoDB drivers implemented on top of PyMongo."""
+"""Advanced options for MongoDB drivers implemented on top of PyMongo.
+
+.. seealso:: This module is compatible with both the synchronous and asynchronous PyMongo APIs.
+"""
 from __future__ import annotations
 
 from collections import namedtuple
@@ -36,7 +39,7 @@ class DriverInfo(namedtuple("DriverInfo", ["name", "version", "platform"])):
         for key, value in self._asdict().items():
             if value is not None and not isinstance(value, str):
                 raise TypeError(
-                    f"Wrong type for DriverInfo {key} option, value must be an instance of str"
+                    f"Wrong type for DriverInfo {key} option, value must be an instance of str, not {type(value)}"
                 )
 
         return self

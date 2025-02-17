@@ -16,22 +16,37 @@ from __future__ import annotations
 import itertools
 import unittest
 
-from mockupdb import MockupDB, OpMsg, going
+import pytest
+
+try:
+    from mockupdb import MockupDB, OpMsg, going
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
 from operations import operations  # type: ignore[import]
 
 from pymongo import MongoClient, ReadPreference
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
 from pymongo.read_preferences import (
     _MONGOS_MODES,
     make_read_preference,
     read_pref_mode_from_name,
 )
 
+pytestmark = pytest.mark.mockupdb
+
 
 class TestMongosCommandReadMode(unittest.TestCase):
     def test_aggregate(self):
         server = MockupDB()
         server.autoresponds(
-            "ismaster", ismaster=True, msg="isdbgrid", minWireVersion=2, maxWireVersion=6
+            "ismaster",
+            ismaster=True,
+            msg="isdbgrid",
+            minWireVersion=2,
+            maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
         )
         self.addCleanup(server.stop)
         server.run()
@@ -66,7 +81,11 @@ def create_mongos_read_mode_test(mode, operation):
         self.addCleanup(server.stop)
         server.run()
         server.autoresponds(
-            "ismaster", ismaster=True, msg="isdbgrid", minWireVersion=2, maxWireVersion=6
+            "ismaster",
+            ismaster=True,
+            msg="isdbgrid",
+            minWireVersion=2,
+            maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
         )
 
         pref = make_read_preference(read_pref_mode_from_name(mode), tag_sets=None)

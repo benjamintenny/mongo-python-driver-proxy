@@ -24,11 +24,22 @@ import itertools
 import unittest
 from queue import Queue
 
-from mockupdb import MockupDB, going
+import pytest
+
+try:
+    from mockupdb import MockupDB, going
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
 from operations import operations  # type: ignore[import]
 
 from pymongo import MongoClient
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
 from pymongo.read_preferences import make_read_preference, read_pref_mode_from_name
+
+pytestmark = pytest.mark.mockupdb
 
 
 class TestSlaveOkaySharded(unittest.TestCase):
@@ -42,7 +53,11 @@ class TestSlaveOkaySharded(unittest.TestCase):
             server.run()
             self.addCleanup(server.stop)
             server.autoresponds(
-                "ismaster", minWireVersion=2, maxWireVersion=6, ismaster=True, msg="isdbgrid"
+                "ismaster",
+                minWireVersion=2,
+                maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
+                ismaster=True,
+                msg="isdbgrid",
             )
 
         self.mongoses_uri = f"mongodb://{self.mongos1.address_string},{self.mongos2.address_string}"

@@ -15,11 +15,22 @@ from __future__ import annotations
 
 import unittest
 
-from mockupdb import Future, MockupDB, OpReply, going, wait_until
+import pytest
+
+try:
+    from mockupdb import Future, MockupDB, OpReply, going, wait_until
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
 
 from pymongo import MongoClient
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
 from pymongo.errors import ConnectionFailure
 from pymongo.topology_description import TOPOLOGY_TYPE
+
+pytestmark = pytest.mark.mockupdb
 
 
 class TestNetworkDisconnectPrimary(unittest.TestCase):
@@ -34,7 +45,11 @@ class TestNetworkDisconnectPrimary(unittest.TestCase):
 
         hosts = [server.address_string for server in (primary, secondary)]
         primary_response = OpReply(
-            ismaster=True, setName="rs", hosts=hosts, minWireVersion=2, maxWireVersion=6
+            ismaster=True,
+            setName="rs",
+            hosts=hosts,
+            minWireVersion=2,
+            maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
         )
         primary.autoresponds("ismaster", primary_response)
         secondary.autoresponds(
@@ -44,7 +59,7 @@ class TestNetworkDisconnectPrimary(unittest.TestCase):
             setName="rs",
             hosts=hosts,
             minWireVersion=2,
-            maxWireVersion=6,
+            maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
         )
 
         client = MongoClient(primary.uri, replicaSet="rs")

@@ -21,34 +21,28 @@ import unittest
 sys.path[0:0] = [""]
 
 from test import IntegrationTest, client_context
-from test.utils import OvertCommandListener, rs_or_single_client
+from test.utils import OvertCommandListener
 
 from bson.son import SON
 from pymongo.errors import OperationFailure
 from pymongo.read_concern import ReadConcern
 
+_IS_SYNC = True
+
 
 class TestReadConcern(IntegrationTest):
     listener: OvertCommandListener
 
-    @classmethod
     @client_context.require_connection
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.listener = OvertCommandListener()
-        cls.client = rs_or_single_client(event_listeners=[cls.listener])
-        cls.db = cls.client.pymongo_test
+    def setUp(self):
+        super().setUp()
+        self.listener = OvertCommandListener()
+        self.client = self.rs_or_single_client(event_listeners=[self.listener])
+        self.db = self.client.pymongo_test
         client_context.client.pymongo_test.create_collection("coll")
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.client.close()
-        client_context.client.pymongo_test.drop_collection("coll")
-        super().tearDownClass()
-
     def tearDown(self):
-        self.listener.reset()
-        super().tearDown()
+        client_context.client.pymongo_test.drop_collection("coll")
 
     def test_read_concern(self):
         rc = ReadConcern()
@@ -67,7 +61,7 @@ class TestReadConcern(IntegrationTest):
 
     def test_read_concern_uri(self):
         uri = f"mongodb://{client_context.pair}/?readConcernLevel=majority"
-        client = rs_or_single_client(uri, connect=False)
+        client = self.rs_or_single_client(uri, connect=False)
         self.assertEqual(ReadConcern("majority"), client.read_concern)
 
     def test_invalid_read_concern(self):
@@ -79,14 +73,14 @@ class TestReadConcern(IntegrationTest):
     def test_find_command(self):
         # readConcern not sent in command if not specified.
         coll = self.db.coll
-        tuple(coll.find({"field": "value"}))
+        coll.find({"field": "value"}).to_list()
         self.assertNotIn("readConcern", self.listener.started_events[0].command)
 
         self.listener.reset()
 
         # Explicitly set readConcern to 'local'.
         coll = self.db.get_collection("coll", read_concern=ReadConcern("local"))
-        tuple(coll.find({"field": "value"}))
+        coll.find({"field": "value"}).to_list()
         self.assertEqualCommand(
             SON(
                 [
@@ -101,19 +95,19 @@ class TestReadConcern(IntegrationTest):
     def test_command_cursor(self):
         # readConcern not sent in command if not specified.
         coll = self.db.coll
-        tuple(coll.aggregate([{"$match": {"field": "value"}}]))
+        (coll.aggregate([{"$match": {"field": "value"}}])).to_list()
         self.assertNotIn("readConcern", self.listener.started_events[0].command)
 
         self.listener.reset()
 
         # Explicitly set readConcern to 'local'.
         coll = self.db.get_collection("coll", read_concern=ReadConcern("local"))
-        tuple(coll.aggregate([{"$match": {"field": "value"}}]))
+        (coll.aggregate([{"$match": {"field": "value"}}])).to_list()
         self.assertEqual({"level": "local"}, self.listener.started_events[0].command["readConcern"])
 
     def test_aggregate_out(self):
         coll = self.db.get_collection("coll", read_concern=ReadConcern("local"))
-        tuple(coll.aggregate([{"$match": {"field": "value"}}, {"$out": "output_collection"}]))
+        (coll.aggregate([{"$match": {"field": "value"}}, {"$out": "output_collection"}])).to_list()
 
         # Aggregate with $out supports readConcern MongoDB 4.2 onwards.
         if client_context.version >= (4, 1):

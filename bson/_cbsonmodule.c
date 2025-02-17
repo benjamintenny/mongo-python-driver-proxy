@@ -53,8 +53,10 @@ struct module_state {
     PyObject* Decimal128;
     PyObject* Mapping;
     PyObject* DatetimeMS;
-    PyObject* _min_datetime_ms;
-    PyObject* _max_datetime_ms;
+    PyObject* min_datetime;
+    PyObject* max_datetime;
+    PyObject* replace_args;
+    PyObject* replace_kwargs;
     PyObject* _type_marker_str;
     PyObject* _flags_str;
     PyObject* _pattern_str;
@@ -80,6 +82,8 @@ struct module_state {
     PyObject* _from_uuid_str;
     PyObject* _as_uuid_str;
     PyObject* _from_bid_str;
+    int64_t min_millis;
+    int64_t max_millis;
 };
 
 #define GETSTATE(m) ((struct module_state*)PyModule_GetState(m))
@@ -203,7 +207,7 @@ static PyObject* _test_long_long_to_str(PyObject* self, PyObject* args) {
  *
  * Returns a new ref */
 static PyObject* _error(char* name) {
-    PyObject* error;
+    PyObject* error = NULL;
     PyObject* errors = PyImport_ImportModule("bson.errors");
     if (!errors) {
         return NULL;
@@ -253,7 +257,7 @@ static PyObject* datetime_from_millis(long long millis) {
      * 2. Multiply that by 1000:                  253402300799000
      * 3. Add in microseconds divided by 1000     253402300799999
      *
-     * (Note: BSON doesn't support microsecond accuracy, hence the rounding.)
+     * (Note: BSON doesn't support microsecond accuracy, hence the truncation.)
      *
      * To decode we could do:
      * 1. Get seconds: timestamp / 1000:          253402300799
@@ -275,7 +279,7 @@ static PyObject* datetime_from_millis(long long millis) {
      * micros = diff * 1000                       111000
      * Resulting in datetime(1, 1, 1, 1, 1, 1, 111000) -- the expected result
      */
-    PyObject* datetime;
+    PyObject* datetime = NULL;
     int diff = (int)(((millis % 1000) + 1000) % 1000);
     int microseconds = diff * 1000;
     Time64_T seconds = (millis - diff) / 1000;
@@ -290,7 +294,7 @@ static PyObject* datetime_from_millis(long long millis) {
                                           timeinfo.tm_sec,
                                           microseconds);
     if(!datetime) {
-        PyObject *etype, *evalue, *etrace;
+        PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
 
         /*
         * Calling _error clears the error state, so fetch it first.
@@ -302,7 +306,7 @@ static PyObject* datetime_from_millis(long long millis) {
             if (evalue) {
                 PyObject* err_msg = PyObject_Str(evalue);
                 if (err_msg) {
-                    PyObject* appendage = PyUnicode_FromString(" (Consider Using CodecOptions(datetime_conversion=DATETIME_AUTO) or MongoClient(datetime_conversion='DATETIME_AUTO')). See: https://pymongo.readthedocs.io/en/stable/examples/datetimes.html#handling-out-of-range-datetimes");
+                    PyObject* appendage = PyUnicode_FromString(" (Consider Using CodecOptions(datetime_conversion=DATETIME_AUTO) or MongoClient(datetime_conversion='DATETIME_AUTO')). See: https://www.mongodb.com/docs/languages/python/pymongo-driver/current/data-formats/dates-and-times/#handling-out-of-range-datetimes");
                     if (appendage) {
                         PyObject* msg = PyUnicode_Concat(err_msg, appendage);
                         if (msg) {
@@ -346,8 +350,8 @@ static PyObject* datetime_ms_from_millis(PyObject* self, long long millis){
         return NULL;
     }
 
-    PyObject* dt;
-    PyObject* ll_millis;
+    PyObject* dt = NULL;
+    PyObject* ll_millis = NULL;
 
     if (!(ll_millis = PyLong_FromLongLong(millis))){
         return NULL;
@@ -374,6 +378,117 @@ static int millis_from_datetime_ms(PyObject* dt, long long* out){
     }
     *out = millis;
     return 1;
+}
+
+static PyObject* decode_datetime(PyObject* self, long long millis, const codec_options_t* options){
+    PyObject* naive = NULL;
+    PyObject* replace = NULL;
+    PyObject* value = NULL;
+    struct module_state *state = GETSTATE(self);
+    if (!state) {
+        goto invalid;
+    }
+    if (options->datetime_conversion == DATETIME_MS){
+        return datetime_ms_from_millis(self, millis);
+    }
+
+    int dt_clamp = options->datetime_conversion == DATETIME_CLAMP;
+    int dt_auto = options->datetime_conversion == DATETIME_AUTO;
+
+    if (dt_clamp || dt_auto){
+        int64_t min_millis = state->min_millis;
+        int64_t max_millis = state->max_millis;
+        int64_t min_millis_offset = 0;
+        int64_t max_millis_offset = 0;
+        if (options->tz_aware && options->tzinfo && options->tzinfo != Py_None) {
+            PyObject* utcoffset = PyObject_CallMethodObjArgs(options->tzinfo, state->_utcoffset_str, state->min_datetime, NULL);
+            if (utcoffset == NULL) {
+                return 0;
+            }
+            if (utcoffset != Py_None) {
+                if (!PyDelta_Check(utcoffset)) {
+                    PyObject* BSONError = _error("BSONError");
+                    if (BSONError) {
+                        PyErr_SetString(BSONError, "tzinfo.utcoffset() did not return a datetime.timedelta");
+                        Py_DECREF(BSONError);
+                    }
+                    Py_DECREF(utcoffset);
+                    return 0;
+                }
+                min_millis_offset = (PyDateTime_DELTA_GET_DAYS(utcoffset) * (int64_t)86400 +
+                                     PyDateTime_DELTA_GET_SECONDS(utcoffset)) * (int64_t)1000 +
+                                     (PyDateTime_DELTA_GET_MICROSECONDS(utcoffset) / 1000);
+            }
+            Py_DECREF(utcoffset);
+            utcoffset = PyObject_CallMethodObjArgs(options->tzinfo, state->_utcoffset_str, state->max_datetime, NULL);
+            if (utcoffset == NULL) {
+                return 0;
+            }
+            if (utcoffset != Py_None) {
+                if (!PyDelta_Check(utcoffset)) {
+                    PyObject* BSONError = _error("BSONError");
+                    if (BSONError) {
+                        PyErr_SetString(BSONError, "tzinfo.utcoffset() did not return a datetime.timedelta");
+                        Py_DECREF(BSONError);
+                    }
+                    Py_DECREF(utcoffset);
+                    return 0;
+                }
+                max_millis_offset = (PyDateTime_DELTA_GET_DAYS(utcoffset) * (int64_t)86400 +
+                                     PyDateTime_DELTA_GET_SECONDS(utcoffset)) * (int64_t)1000 +
+                                     (PyDateTime_DELTA_GET_MICROSECONDS(utcoffset) / 1000);
+            }
+            Py_DECREF(utcoffset);
+        }
+        if (min_millis_offset < 0) {
+            min_millis -= min_millis_offset;
+        }
+
+        if (max_millis_offset > 0) {
+            max_millis -= max_millis_offset;
+        }
+
+        if (dt_clamp) {
+            if (millis < min_millis) {
+                millis = min_millis;
+            } else if (millis > max_millis) {
+                millis = max_millis;
+            }
+            // Continues from here to return a datetime.
+        } else { // dt_auto
+            if (millis < min_millis || millis > max_millis){
+                return datetime_ms_from_millis(self, millis);
+            }
+        }
+    }
+
+    naive = datetime_from_millis(millis);
+    if (!naive) {
+        goto invalid;
+    }
+
+    if (!options->tz_aware) { /* In the naive case, we're done here. */
+        return naive;
+    }
+    replace = PyObject_GetAttr(naive, state->_replace_str);
+    if (!replace) {
+        goto invalid;
+    }
+    value = PyObject_Call(replace, state->replace_args, state->replace_kwargs);
+    if (!value) {
+        goto invalid;
+    }
+
+    /* convert to local time */
+    if (options->tzinfo != Py_None) {
+        PyObject* temp = PyObject_CallMethodObjArgs(value, state->_astimezone_str, options->tzinfo, NULL);
+        Py_DECREF(value);
+        value = temp;
+    }
+invalid:
+    Py_XDECREF(naive);
+    Py_XDECREF(replace);
+    return value;
 }
 
 /* Just make this compatible w/ the old API. */
@@ -482,6 +597,8 @@ static int _load_python_objects(PyObject* module) {
     PyObject* empty_string = NULL;
     PyObject* re_compile = NULL;
     PyObject* compiled = NULL;
+    PyObject* min_datetime_ms = NULL;
+    PyObject* max_datetime_ms = NULL;
     struct module_state *state = GETSTATE(module);
     if (!state) {
         return 1;
@@ -530,10 +647,34 @@ static int _load_python_objects(PyObject* module) {
         _load_object(&state->UUID, "uuid", "UUID") ||
         _load_object(&state->Mapping, "collections.abc", "Mapping") ||
         _load_object(&state->DatetimeMS, "bson.datetime_ms", "DatetimeMS") ||
-        _load_object(&state->_min_datetime_ms, "bson.datetime_ms", "_min_datetime_ms") ||
-        _load_object(&state->_max_datetime_ms, "bson.datetime_ms", "_max_datetime_ms")) {
+        _load_object(&min_datetime_ms, "bson.datetime_ms", "_MIN_UTC_MS") ||
+        _load_object(&max_datetime_ms, "bson.datetime_ms", "_MAX_UTC_MS") ||
+        _load_object(&state->min_datetime, "bson.datetime_ms", "_MIN_UTC") ||
+        _load_object(&state->max_datetime, "bson.datetime_ms", "_MAX_UTC")) {
         return 1;
     }
+
+    state->min_millis = PyLong_AsLongLong(min_datetime_ms);
+    state->max_millis = PyLong_AsLongLong(max_datetime_ms);
+    Py_DECREF(min_datetime_ms);
+    Py_DECREF(max_datetime_ms);
+    if ((state->min_millis == -1 || state->max_millis == -1) && PyErr_Occurred()) {
+        return 1;
+    }
+
+    /* Speed up datetime.replace(tzinfo=utc) call */
+    state->replace_args = PyTuple_New(0);
+    if (!state->replace_args) {
+        return 1;
+    }
+    state->replace_kwargs = PyDict_New();
+    if (!state->replace_kwargs) {
+        return 1;
+    }
+    if (PyDict_SetItem(state->replace_kwargs, state->_tzinfo_str, state->UTC) == -1) {
+        return 1;
+    }
+
     /* Reload our REType hack too. */
     empty_string = PyBytes_FromString("");
     if (empty_string == NULL) {
@@ -1247,8 +1388,8 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             return 0;
         if (utcoffset != Py_None) {
             PyObject* result = PyNumber_Subtract(value, utcoffset);
-            Py_DECREF(utcoffset);
             if (!result) {
+                Py_DECREF(utcoffset);
                 return 0;
             }
             millis = millis_from_datetime(result);
@@ -1256,6 +1397,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
         } else {
             millis = millis_from_datetime(value);
         }
+        Py_DECREF(utcoffset);
         *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x09;
         return buffer_write_int64(buffer, (int64_t)millis);
     } else if (PyObject_TypeCheck(value, state->REType)) {
@@ -1502,6 +1644,56 @@ fail:
     return bytes_written;
 }
 
+
+/* Update Invalid Document error message to include doc.
+ */
+void handle_invalid_doc_error(PyObject* dict) {
+    PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
+    PyObject *msg = NULL, *dict_str = NULL, *new_msg = NULL;
+    PyErr_Fetch(&etype, &evalue, &etrace);
+    PyObject *InvalidDocument = _error("InvalidDocument");
+    if (InvalidDocument == NULL) {
+        goto cleanup;
+    }
+
+    if (evalue && PyErr_GivenExceptionMatches(etype, InvalidDocument)) {
+        PyObject *msg = PyObject_Str(evalue);
+        if (msg) {
+            // Prepend doc to the existing message
+            PyObject *dict_str = PyObject_Str(dict);
+            if (dict_str == NULL) {
+                goto cleanup;
+            }
+            const char * dict_str_utf8 = PyUnicode_AsUTF8(dict_str);
+            if (dict_str_utf8 == NULL) {
+                goto cleanup;
+            }
+            const char * msg_utf8 = PyUnicode_AsUTF8(msg);
+            if (msg_utf8 == NULL) {
+                goto cleanup;
+            }
+            PyObject *new_msg = PyUnicode_FromFormat("Invalid document %s | %s", dict_str_utf8, msg_utf8);
+            Py_DECREF(evalue);
+            Py_DECREF(etype);
+            etype = InvalidDocument;
+            InvalidDocument = NULL;
+            if (new_msg) {
+                evalue = new_msg;
+            } else {
+                evalue = msg;
+            }
+        }
+        PyErr_NormalizeException(&etype, &evalue, &etrace);
+    }
+cleanup:
+    PyErr_Restore(etype, evalue, etrace);
+    Py_XDECREF(msg);
+    Py_XDECREF(InvalidDocument);
+    Py_XDECREF(dict_str);
+    Py_XDECREF(new_msg);
+}
+
+
 /* returns the number of bytes written or 0 on failure */
 int write_dict(PyObject* self, buffer_t buffer,
                PyObject* dict, unsigned char check_keys,
@@ -1601,6 +1793,9 @@ int write_dict(PyObject* self, buffer_t buffer,
         while (PyDict_Next(dict, &pos, &key, &value)) {
             if (!decode_and_write_pair(self, buffer, key, value,
                                     check_keys, options, top_level)) {
+                if (PyErr_Occurred() && top_level) {
+                    handle_invalid_doc_error(dict);
+                }
                 return 0;
             }
         }
@@ -1619,6 +1814,9 @@ int write_dict(PyObject* self, buffer_t buffer,
             }
             if (!decode_and_write_pair(self, buffer, key, value,
                                     check_keys, options, top_level)) {
+                if (PyErr_Occurred() && top_level) {
+                    handle_invalid_doc_error(dict);
+                }
                 Py_DECREF(key);
                 Py_DECREF(value);
                 Py_DECREF(iter);
@@ -1648,7 +1846,7 @@ static PyObject* _cbson_dict_to_bson(PyObject* self, PyObject* args) {
     PyObject* result;
     unsigned char check_keys;
     unsigned char top_level = 1;
-    PyObject* options_obj;
+    PyObject* options_obj = NULL;
     codec_options_t options;
     buffer_t buffer;
     PyObject* raw_bson_document_bytes_obj;
@@ -2043,11 +2241,6 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
         }
     case 9:
         {
-            PyObject* naive;
-            PyObject* replace;
-            PyObject* args;
-            PyObject* kwargs;
-            PyObject* astimezone;
             int64_t millis;
             if (max < 8) {
                 goto invalid;
@@ -2056,120 +2249,7 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             millis = (int64_t)BSON_UINT64_FROM_LE(millis);
             *position += 8;
 
-            if (options->datetime_conversion == DATETIME_MS){
-                value = datetime_ms_from_millis(self, millis);
-                break;
-            }
-
-            int dt_clamp = options->datetime_conversion == DATETIME_CLAMP;
-            int dt_auto = options->datetime_conversion == DATETIME_AUTO;
-
-
-            if (dt_clamp || dt_auto){
-                PyObject *min_millis_fn_res;
-                PyObject *max_millis_fn_res;
-                int64_t min_millis;
-                int64_t max_millis;
-
-                if (options->tz_aware){
-                    PyObject* tzinfo = options->tzinfo;
-                    if (tzinfo == Py_None) {
-                        // Default to UTC.
-                        tzinfo = state->UTC;
-                    }
-                    min_millis_fn_res = PyObject_CallFunctionObjArgs(state->_min_datetime_ms, tzinfo, NULL);
-                    max_millis_fn_res = PyObject_CallFunctionObjArgs(state->_max_datetime_ms, tzinfo, NULL);
-                } else {
-                    min_millis_fn_res = PyObject_CallObject(state->_min_datetime_ms, NULL);
-                    max_millis_fn_res = PyObject_CallObject(state->_max_datetime_ms, NULL);
-                }
-
-                if (!min_millis_fn_res || !max_millis_fn_res){
-                    Py_XDECREF(min_millis_fn_res);
-                    Py_XDECREF(max_millis_fn_res);
-                    goto invalid;
-                }
-
-                min_millis = PyLong_AsLongLong(min_millis_fn_res);
-                max_millis = PyLong_AsLongLong(max_millis_fn_res);
-
-                if ((min_millis == -1 || max_millis == -1) && PyErr_Occurred())
-                {
-                    // min/max_millis check
-                    goto invalid;
-                }
-
-                if (dt_clamp) {
-                    if (millis < min_millis) {
-                        millis = min_millis;
-                    } else if (millis > max_millis) {
-                        millis = max_millis;
-                    }
-                    // Continues from here to return a datetime.
-                } else { // dt_auto
-                    if (millis < min_millis || millis > max_millis){
-                        value = datetime_ms_from_millis(self, millis);
-                        break; // Out-of-range so done.
-                    }
-                }
-            }
-
-            naive = datetime_from_millis(millis);
-            if (!options->tz_aware) { /* In the naive case, we're done here. */
-                value = naive;
-                break;
-            }
-
-            if (!naive) {
-                goto invalid;
-            }
-            replace = PyObject_GetAttr(naive, state->_replace_str);
-            Py_DECREF(naive);
-            if (!replace) {
-                goto invalid;
-            }
-            args = PyTuple_New(0);
-            if (!args) {
-                Py_DECREF(replace);
-                goto invalid;
-            }
-            kwargs = PyDict_New();
-            if (!kwargs) {
-                Py_DECREF(replace);
-                Py_DECREF(args);
-                goto invalid;
-            }
-            if (PyDict_SetItem(kwargs, state->_tzinfo_str, state->UTC) == -1) {
-                Py_DECREF(replace);
-                Py_DECREF(args);
-                Py_DECREF(kwargs);
-                goto invalid;
-            }
-            value = PyObject_Call(replace, args, kwargs);
-            if (!value) {
-                Py_DECREF(replace);
-                Py_DECREF(args);
-                Py_DECREF(kwargs);
-                goto invalid;
-            }
-
-            /* convert to local time */
-            if (options->tzinfo != Py_None) {
-                astimezone = PyObject_GetAttr(value, state->_astimezone_str);
-                Py_DECREF(value);
-                if (!astimezone) {
-                    Py_DECREF(replace);
-                    Py_DECREF(args);
-                    Py_DECREF(kwargs);
-                    goto invalid;
-                }
-                value = PyObject_CallFunctionObjArgs(astimezone, options->tzinfo, NULL);
-                Py_DECREF(astimezone);
-            }
-
-            Py_DECREF(replace);
-            Py_DECREF(args);
-            Py_DECREF(kwargs);
+            value = decode_datetime(self, millis, options);
             break;
         }
     case 11:
@@ -2488,8 +2568,8 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
      * Wrap any non-InvalidBSON errors in InvalidBSON.
      */
     if (PyErr_Occurred()) {
-        PyObject *etype, *evalue, *etrace;
-        PyObject *InvalidBSON;
+        PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
+        PyObject *InvalidBSON = NULL;
 
         /*
          * Calling _error clears the error state, so fetch it first.
@@ -2561,8 +2641,8 @@ static int _element_to_dict(PyObject* self, const char* string,
     if (!*name) {
         /* If NULL is returned then wrap the UnicodeDecodeError
            in an InvalidBSON error */
-        PyObject *etype, *evalue, *etrace;
-        PyObject *InvalidBSON;
+        PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
+        PyObject *InvalidBSON = NULL;
 
         PyErr_Fetch(&etype, &evalue, &etrace);
         if (PyErr_GivenExceptionMatches(etype, PyExc_Exception)) {
@@ -2596,7 +2676,7 @@ static PyObject* _cbson_element_to_dict(PyObject* self, PyObject* args) {
     /* TODO: Support buffer protocol */
     char* string;
     PyObject* bson;
-    PyObject* options_obj;
+    PyObject* options_obj = NULL;
     codec_options_t options;
     unsigned position;
     unsigned max;
@@ -2708,7 +2788,7 @@ static PyObject* _cbson_bson_to_dict(PyObject* self, PyObject* args) {
     int32_t size;
     Py_ssize_t total_size;
     const char* string;
-    PyObject* bson;
+    PyObject* bson = NULL;
     codec_options_t options;
     PyObject* result = NULL;
     PyObject* options_obj;
@@ -2901,11 +2981,31 @@ static PyObject* _cbson_array_of_documents_to_buffer(PyObject* self, PyObject* a
                             "not enough data for a BSON document");
             Py_DECREF(InvalidBSON);
         }
-        goto done;
+        goto fail;
     }
 
     memcpy(&size, string, 4);
     size = BSON_UINT32_FROM_LE(size);
+
+    /* validate the size of the array */
+    if (view.len != (int32_t)size || (int32_t)size < BSON_MIN_SIZE) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON, "objsize too large");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
+    }
+
+    if (string[size - 1]) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON, "bad eoo");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
+    }
+
     /* save space for length */
     if (pymongo_buffer_save_space(buffer, size) == -1) {
         goto fail;
@@ -2948,28 +3048,20 @@ static PyObject* _cbson_array_of_documents_to_buffer(PyObject* self, PyObject* a
             goto fail;
          }
 
-        if (view.len < size) {
-            PyObject* InvalidBSON = _error("InvalidBSON");
-            if (InvalidBSON) {
-                PyErr_SetString(InvalidBSON, "objsize too large");
-                Py_DECREF(InvalidBSON);
-            }
-            goto fail;
-        }
-
-        if (string[size - 1]) {
-            PyObject* InvalidBSON = _error("InvalidBSON");
-            if (InvalidBSON) {
-                PyErr_SetString(InvalidBSON, "bad eoo");
-                Py_DECREF(InvalidBSON);
-            }
-            goto fail;
-        }
-
         if (pymongo_buffer_write(buffer, string + position, value_length) == 1) {
             goto fail;
         }
         position += value_length;
+    }
+
+    if (position != size - 1) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON,
+                            "bad object or element length");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
     }
 
     /* objectify buffer */
@@ -3041,6 +3133,10 @@ static int _cbson_traverse(PyObject *m, visitproc visit, void *arg) {
     Py_VISIT(state->_from_uuid_str);
     Py_VISIT(state->_as_uuid_str);
     Py_VISIT(state->_from_bid_str);
+    Py_VISIT(state->min_datetime);
+    Py_VISIT(state->max_datetime);
+    Py_VISIT(state->replace_args);
+    Py_VISIT(state->replace_kwargs);
     return 0;
 }
 
@@ -3085,6 +3181,10 @@ static int _cbson_clear(PyObject *m) {
     Py_CLEAR(state->_from_uuid_str);
     Py_CLEAR(state->_as_uuid_str);
     Py_CLEAR(state->_from_bid_str);
+    Py_CLEAR(state->min_datetime);
+    Py_CLEAR(state->max_datetime);
+    Py_CLEAR(state->replace_args);
+    Py_CLEAR(state->replace_kwargs);
     return 0;
 }
 
@@ -3140,6 +3240,9 @@ static PyModuleDef_Slot _cbson_slots[] = {
     {Py_mod_exec, _cbson_exec},
 #if defined(Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED)
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED},
+#endif
+#if PY_VERSION_HEX >= 0x030D0000
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
 #endif
     {0, NULL},
 };

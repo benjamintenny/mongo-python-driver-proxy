@@ -15,33 +15,39 @@
 """Run the sdam monitoring spec tests."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 import time
+from pathlib import Path
 
 sys.path[0:0] = [""]
 
 from test import IntegrationTest, client_context, client_knobs, unittest
 from test.utils import (
     ServerAndTopologyEventListener,
-    rs_or_single_client,
     server_name_to_type,
     wait_until,
 )
 
 from bson.json_util import object_hook
 from pymongo import MongoClient, monitoring
-from pymongo.collection import Collection
 from pymongo.common import clean_node
 from pymongo.errors import ConnectionFailure, NotPrimaryError
 from pymongo.hello import Hello
-from pymongo.monitor import Monitor
 from pymongo.server_description import ServerDescription
+from pymongo.synchronous.collection import Collection
+from pymongo.synchronous.monitor import Monitor
 from pymongo.topology_description import TOPOLOGY_TYPE
 
+_IS_SYNC = True
+
 # Location of JSON test specifications.
-_TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "sdam_monitoring")
+if _IS_SYNC:
+    TEST_PATH = os.path.join(Path(__file__).resolve().parent, "sdam_monitoring")
+else:
+    TEST_PATH = os.path.join(Path(__file__).resolve().parent.parent, "sdam_monitoring")
 
 
 def compare_server_descriptions(expected, actual):
@@ -122,7 +128,7 @@ def compare_events(expected_dict, actual):
 
     elif expected_type == "topology_opening_event":
         if not isinstance(actual, monitoring.TopologyOpenedEvent):
-            return False, "Expected TopologyOpeningEvent, got %s" % (actual.__class__)
+            return False, "Expected TopologyOpenedEvent, got %s" % (actual.__class__)
 
     elif expected_type == "topology_description_changed_event":
         if not isinstance(actual, monitoring.TopologyDescriptionChangedEvent):
@@ -179,7 +185,7 @@ class TestAllScenarios(IntegrationTest):
 
 def create_test(scenario_def):
     def run_scenario(self):
-        with client_knobs(events_queue_frequency=0.1):
+        with client_knobs(events_queue_frequency=0.05, min_heartbeat_interval=0.05):
             _run_scenario(self)
 
     def _run_scenario(self):
@@ -216,7 +222,7 @@ def create_test(scenario_def):
                 )
 
                 # Wait some time to catch possible lagging extra events.
-                time.sleep(0.5)
+                wait_until(lambda: topology._events.empty(), "publish lagging events")
 
                 i = 0
                 while i < expected_len:
@@ -248,7 +254,7 @@ def create_test(scenario_def):
 
 
 def create_tests():
-    for dirpath, _, filenames in os.walk(_TEST_PATH):
+    for dirpath, _, filenames in os.walk(TEST_PATH):
         for filename in filenames:
             with open(os.path.join(dirpath, filename)) as scenario_stream:
                 scenario_def = json.load(scenario_stream, object_hook=object_hook)
@@ -269,28 +275,32 @@ class TestSdamMonitoring(IntegrationTest):
     coll: Collection
 
     @classmethod
-    @client_context.require_failCommand_fail_point
     def setUpClass(cls):
-        super().setUpClass()
         # Speed up the tests by decreasing the event publish frequency.
-        cls.knobs = client_knobs(events_queue_frequency=0.1)
+        cls.knobs = client_knobs(
+            events_queue_frequency=0.1, heartbeat_frequency=0.1, min_heartbeat_interval=0.1
+        )
         cls.knobs.enable()
         cls.listener = ServerAndTopologyEventListener()
-        retry_writes = client_context.supports_transactions()
-        cls.test_client = rs_or_single_client(
-            event_listeners=[cls.listener], retryWrites=retry_writes
-        )
-        cls.coll = cls.test_client[cls.client.db.name].test
-        cls.coll.insert_one({})
 
     @classmethod
     def tearDownClass(cls):
-        cls.test_client.close()
         cls.knobs.disable()
-        super().tearDownClass()
 
+    @client_context.require_failCommand_fail_point
     def setUp(self):
+        super().setUp()
+
+        retry_writes = client_context.supports_transactions()
+        self.test_client = self.rs_or_single_client(
+            event_listeners=[self.listener], retryWrites=retry_writes
+        )
+        self.coll = self.test_client[self.client.db.name].test
+        self.coll.insert_one({})
         self.listener.reset()
+
+    def tearDown(self):
+        super().tearDown()
 
     def _test_app_error(self, fail_command_opts, expected_error):
         address = self.test_client.address
@@ -333,7 +343,7 @@ class TestSdamMonitoring(IntegrationTest):
                 and len(self.listener.matching(discovered_node)) >= 1
             )
 
-        # Topology events are published asynchronously
+        # Topology events are not published synchronously
         wait_until(marked_unknown_and_rediscovered, "rediscover node")
 
         # Expect a single ServerDescriptionChangedEvent for the network error.

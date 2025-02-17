@@ -20,11 +20,13 @@ import sys
 sys.path[0:0] = [""]
 
 from test import IntegrationTest, client_knobs, unittest
-from test.utils import HeartbeatEventListener, MockPool, single_client, wait_until
+from test.utils import HeartbeatEventListener, MockPool, wait_until
 
 from pymongo.errors import ConnectionFailure
 from pymongo.hello import Hello, HelloCompat
-from pymongo.monitor import Monitor
+from pymongo.synchronous.monitor import Monitor
+
+_IS_SYNC = True
 
 
 class TestHeartbeatMonitoring(IntegrationTest):
@@ -40,8 +42,12 @@ class TestHeartbeatMonitoring(IntegrationTest):
                         raise responses[1]
                     return Hello(responses[1]), 99
 
-            m = single_client(
-                h=uri, event_listeners=(listener,), _monitor_class=MockMonitor, _pool_class=MockPool
+            _ = self.single_client(
+                h=uri,
+                event_listeners=(listener,),
+                _monitor_class=MockMonitor,
+                _pool_class=MockPool,
+                connect=True,
             )
 
             expected_len = len(expected_results)
@@ -50,20 +56,16 @@ class TestHeartbeatMonitoring(IntegrationTest):
             # of this test.
             wait_until(lambda: len(listener.events) >= expected_len, "publish all events")
 
-        try:
-            # zip gives us len(expected_results) pairs.
-            for expected, actual in zip(expected_results, listener.events):
-                self.assertEqual(expected, actual.__class__.__name__)
-                self.assertEqual(actual.connection_id, responses[0])
-                if expected != "ServerHeartbeatStartedEvent":
-                    if isinstance(actual.reply, Hello):
-                        self.assertEqual(actual.duration, 99)
-                        self.assertEqual(actual.reply._doc, responses[1])
-                    else:
-                        self.assertEqual(actual.reply, responses[1])
-
-        finally:
-            m.close()
+        # zip gives us len(expected_results) pairs.
+        for expected, actual in zip(expected_results, listener.events):
+            self.assertEqual(expected, actual.__class__.__name__)
+            self.assertEqual(actual.connection_id, responses[0])
+            if expected != "ServerHeartbeatStartedEvent":
+                if isinstance(actual.reply, Hello):
+                    self.assertEqual(actual.duration, 99)
+                    self.assertEqual(actual.reply._doc, responses[1])
+                else:
+                    self.assertEqual(actual.reply, responses[1])
 
     def test_standalone(self):
         responses = (

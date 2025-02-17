@@ -26,14 +26,6 @@ from pymongo.server_type import SERVER_TYPE
 from pymongo.typings import ClusterTime, _DocumentType
 
 
-class HelloCompat:
-    CMD = "hello"
-    LEGACY_CMD = "ismaster"
-    PRIMARY = "isWritablePrimary"
-    LEGACY_PRIMARY = "ismaster"
-    LEGACY_ERROR = "not master"
-
-
 def _get_server_type(doc: Mapping[str, Any]) -> int:
     """Determine the server type from a hello response."""
     if not doc.get("ok"):
@@ -60,6 +52,14 @@ def _get_server_type(doc: Mapping[str, Any]) -> int:
         return SERVER_TYPE.Mongos
     else:
         return SERVER_TYPE.Standalone
+
+
+class HelloCompat:
+    CMD = "hello"
+    LEGACY_CMD = "ismaster"
+    PRIMARY = "isWritablePrimary"
+    LEGACY_PRIMARY = "ismaster"
+    LEGACY_ERROR = "not master"
 
 
 class Hello(Generic[_DocumentType]):
@@ -133,7 +133,7 @@ class Hello(Generic[_DocumentType]):
 
     @property
     def max_message_size(self) -> int:
-        return self._doc.get("maxMessageSizeBytes", 2 * self.max_bson_size)
+        return self._doc.get("maxMessageSizeBytes", common.MAX_MESSAGE_SIZE)
 
     @property
     def max_write_batch_size(self) -> int:

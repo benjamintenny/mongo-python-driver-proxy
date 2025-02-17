@@ -1,6 +1,11 @@
 PyMongo |release| Documentation
 ===============================
 
+.. note:: The PyMongo documentation has been migrated to the
+   `MongoDB Documentation site <https://www.mongodb.com/docs/languages/python/pymongo-driver/current>`_.
+   As of PyMongo 4.10, the ReadTheDocs site will contain the detailed changelog and API docs, while the
+   rest of the documentation will only appear on the MongoDB Documentation site.
+
 Overview
 --------
 **PyMongo** is a Python distribution containing tools for working with
@@ -15,6 +20,9 @@ everything you need to know to use **PyMongo**.
 
 :doc:`tutorial`
   Start here for a quick overview.
+
+:doc:`async-tutorial`
+  Start here for a quick overview of the asynchronous API.
 
 :doc:`examples/index`
   Examples of how to perform specific tasks.
@@ -92,21 +100,14 @@ pull request.
 Changes
 -------
 See the :doc:`changelog` for a full list of changes to PyMongo.
-For older versions of the documentation please see the
-`archive list <http://api.mongodb.org/python/>`_.
 
 About This Documentation
 ------------------------
 This documentation is generated using the `Sphinx
 <https://www.sphinx-doc.org/en/master/>`_ documentation generator. The source files
 for the documentation are located in the *doc/* directory of the
-**PyMongo** distribution. To generate the docs locally run the
-following command from the root directory of the **PyMongo** source:
-
-.. code-block:: bash
-
-  $ pip install tox
-  $ tox -m doc
+**PyMongo** distribution. See the PyMongo `contributing guide  <https://github.com/mongodb/mongo-python-driver/blob/master/CONTRIBUTING.md>`_
+for instructions on the building the docs from source.
 
 Indices and tables
 ------------------
@@ -121,6 +122,7 @@ Indices and tables
    atlas
    installation
    tutorial
+   async-tutorial
    examples/index
    faq
    compatibility-policy

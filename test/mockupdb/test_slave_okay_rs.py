@@ -20,10 +20,21 @@ from __future__ import annotations
 
 import unittest
 
-from mockupdb import MockupDB, going
+import pytest
+
+try:
+    from mockupdb import MockupDB, going
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
 from operations import operations  # type: ignore[import]
 
 from pymongo import MongoClient
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
+
+pytestmark = pytest.mark.mockupdb
 
 
 class TestSlaveOkayRS(unittest.TestCase):
@@ -35,7 +46,12 @@ class TestSlaveOkayRS(unittest.TestCase):
 
         hosts = [server.address_string for server in (self.primary, self.secondary)]
         self.primary.autoresponds(
-            "ismaster", ismaster=True, setName="rs", hosts=hosts, minWireVersion=2, maxWireVersion=6
+            "ismaster",
+            ismaster=True,
+            setName="rs",
+            hosts=hosts,
+            minWireVersion=2,
+            maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
         )
         self.secondary.autoresponds(
             "ismaster",
@@ -44,7 +60,7 @@ class TestSlaveOkayRS(unittest.TestCase):
             setName="rs",
             hosts=hosts,
             minWireVersion=2,
-            maxWireVersion=6,
+            maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
         )
 
 

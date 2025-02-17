@@ -23,11 +23,11 @@ from decimal import Decimal
 from random import random
 from typing import Any, Tuple, Type, no_type_check
 
+from gridfs.synchronous.grid_file import GridIn, GridOut
+
 sys.path[0:0] = [""]
 
-from test import client_context, unittest
-from test.test_client import IntegrationTest
-from test.utils import rs_client
+from test import IntegrationTest, client_context, unittest
 
 from bson import (
     _BUILT_IN_TYPES,
@@ -51,10 +51,12 @@ from bson.codec_options import (
 from bson.errors import InvalidDocument
 from bson.int64 import Int64
 from bson.raw_bson import RawBSONDocument
-from gridfs import GridIn, GridOut
-from pymongo.collection import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pymongo.message import _CursorAddress
+from pymongo.synchronous.collection import ReturnDocument
+from pymongo.synchronous.helpers import next
+
+_IS_SYNC = True
 
 
 class DecimalEncoder(TypeEncoder):
@@ -634,6 +636,7 @@ class TestTypeRegistry(unittest.TestCase):
 
 class TestCollectionWCustomType(IntegrationTest):
     def setUp(self):
+        super().setUp()
         self.db.test.drop()
 
     def tearDown(self):
@@ -707,7 +710,7 @@ class TestCollectionWCustomType(IntegrationTest):
         ]
         result = test.aggregate(pipeline)
 
-        res = list(result)[0]
+        res = (result.to_list())[0]
         self.assertEqual(res["_id"], "complete")
         self.assertIsInstance(res["total_qty"], UndecipherableInt64Type)
         self.assertEqual(res["total_qty"].value, 20)
@@ -755,6 +758,7 @@ class TestCollectionWCustomType(IntegrationTest):
 
 class TestGridFileCustomType(IntegrationTest):
     def setUp(self):
+        super().setUp()
         self.db.drop_collection("fs.files")
         self.db.drop_collection("fs.chunks")
 
@@ -764,9 +768,7 @@ class TestGridFileCustomType(IntegrationTest):
             db.fs,
             _id=5,
             filename="my_file",
-            contentType="text/html",
             chunkSize=1000,
-            aliases=["foo"],
             metadata={"foo": "red", "bar": "blue"},
             bar=3,
             baz="hello",
@@ -775,18 +777,16 @@ class TestGridFileCustomType(IntegrationTest):
         one.close()
 
         two = GridOut(db.fs, 5)
+        two.open()
 
         self.assertEqual("my_file", two.name)
         self.assertEqual("my_file", two.filename)
         self.assertEqual(5, two._id)
         self.assertEqual(11, two.length)
-        self.assertEqual("text/html", two.content_type)
         self.assertEqual(1000, two.chunk_size)
         self.assertTrue(isinstance(two.upload_date, datetime.datetime))
-        self.assertEqual(["foo"], two.aliases)
         self.assertEqual({"foo": "red", "bar": "blue"}, two.metadata)
         self.assertEqual(3, two.bar)
-        self.assertEqual(None, two.md5)
 
         for attr in [
             "_id",
@@ -805,7 +805,9 @@ class TestGridFileCustomType(IntegrationTest):
 class ChangeStreamsWCustomTypesTestMixin:
     @no_type_check
     def change_stream(self, *args, **kwargs):
-        return self.watched_target.watch(*args, **kwargs)
+        stream = self.watched_target.watch(*args, max_await_time_ms=1, **kwargs)
+        self.addCleanup(stream.close)
+        return stream
 
     @no_type_check
     def insert_and_check(self, change_stream, insert_doc, expected_doc):
@@ -817,7 +819,7 @@ class ChangeStreamsWCustomTypesTestMixin:
     def kill_change_stream_cursor(self, change_stream):
         # Cause a cursor not found error on the next getMore.
         cursor = change_stream._cursor
-        address = _CursorAddress(cursor.address, cursor._CommandCursor__ns)
+        address = _CursorAddress(cursor.address, cursor._ns)
         client = self.input_target.database.client
         client._close_cursor_now(cursor.cursor_id, address)
 
@@ -921,11 +923,10 @@ class ChangeStreamsWCustomTypesTestMixin:
 
 
 class TestCollectionChangeStreamsWCustomTypes(IntegrationTest, ChangeStreamsWCustomTypesTestMixin):
-    @classmethod
     @client_context.require_change_streams
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.db.test.delete_many({})
+    def setUp(self):
+        super().setUp()
+        self.db.test.delete_many({})
 
     def tearDown(self):
         self.input_target.drop()
@@ -939,12 +940,11 @@ class TestCollectionChangeStreamsWCustomTypes(IntegrationTest, ChangeStreamsWCus
 
 
 class TestDatabaseChangeStreamsWCustomTypes(IntegrationTest, ChangeStreamsWCustomTypesTestMixin):
-    @classmethod
     @client_context.require_version_min(4, 0, 0)
     @client_context.require_change_streams
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.db.test.delete_many({})
+    def setUp(self):
+        super().setUp()
+        self.db.test.delete_many({})
 
     def tearDown(self):
         self.input_target.drop()
@@ -958,12 +958,11 @@ class TestDatabaseChangeStreamsWCustomTypes(IntegrationTest, ChangeStreamsWCusto
 
 
 class TestClusterChangeStreamsWCustomTypes(IntegrationTest, ChangeStreamsWCustomTypesTestMixin):
-    @classmethod
     @client_context.require_version_min(4, 0, 0)
     @client_context.require_change_streams
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.db.test.delete_many({})
+    def setUp(self):
+        super().setUp()
+        self.db.test.delete_many({})
 
     def tearDown(self):
         self.input_target.drop()
@@ -974,8 +973,7 @@ class TestClusterChangeStreamsWCustomTypes(IntegrationTest, ChangeStreamsWCustom
         if codec_options:
             kwargs["type_registry"] = codec_options.type_registry
             kwargs["document_class"] = codec_options.document_class
-        self.watched_target = rs_client(*args, **kwargs)
-        self.addCleanup(self.watched_target.close)
+        self.watched_target = self.rs_client(*args, **kwargs)
         self.input_target = self.watched_target[self.db.name].test
         # Insert a record to ensure db, coll are created.
         self.input_target.insert_one({"data": "dummy"})

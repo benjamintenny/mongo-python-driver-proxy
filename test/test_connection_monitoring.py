@@ -15,9 +15,11 @@
 """Execute Transactions Spec tests."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
+from pathlib import Path
 
 sys.path[0:0] = [""]
 
@@ -25,17 +27,13 @@ from test import IntegrationTest, client_knobs, unittest
 from test.pymongo_mocks import DummyMonitor
 from test.utils import (
     CMAPListener,
-    SpecTestCreator,
     camel_to_snake,
     client_context,
     get_pool,
     get_pools,
-    rs_or_single_client,
-    single_client,
-    single_client_noauth,
     wait_until,
 )
-from test.utils_spec_runner import SpecRunnerThread
+from test.utils_spec_runner import SpecRunnerThread, SpecTestCreator
 
 from bson.objectid import ObjectId
 from bson.son import SON
@@ -60,9 +58,11 @@ from pymongo.monitoring import (
     PoolCreatedEvent,
     PoolReadyEvent,
 )
-from pymongo.pool import PoolState, _PoolClosedError
 from pymongo.read_preferences import ReadPreference
+from pymongo.synchronous.pool import PoolState, _PoolClosedError
 from pymongo.topology_description import updated_topology_description
+
+_IS_SYNC = True
 
 OBJECT_TYPES = {
     # Event types.
@@ -85,7 +85,10 @@ OBJECT_TYPES = {
 
 class TestCMAP(IntegrationTest):
     # Location of JSON test specifications.
-    TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "connection_monitoring")
+    if _IS_SYNC:
+        TEST_PATH = os.path.join(Path(__file__).resolve().parent, "connection_monitoring")
+    else:
+        TEST_PATH = os.path.join(Path(__file__).resolve().parent.parent, "connection_monitoring")
 
     # Test operations:
 
@@ -245,7 +248,7 @@ class TestCMAP(IntegrationTest):
         else:
             kill_cursor_frequency = interval / 1000.0
         with client_knobs(kill_cursor_frequency=kill_cursor_frequency, min_heartbeat_interval=0.05):
-            client = single_client(**opts)
+            client = self.single_client(**opts)
             # Update the SD to a known type because the DummyMonitor will not.
             # Note we cannot simply call topology.on_change because that would
             # internally call pool.ready() which introduces unexpected
@@ -262,7 +265,6 @@ class TestCMAP(IntegrationTest):
                 client._topology.open()
             else:
                 client._get_topology()
-        self.addCleanup(client.close)
         self.pool = list(client._topology._servers.values())[0].pool
 
         # Map of target names to Thread objects.
@@ -318,14 +320,12 @@ class TestCMAP(IntegrationTest):
     # Prose tests. Numbers correspond to the prose test number in the spec.
     #
     def test_1_client_connection_pool_options(self):
-        client = rs_or_single_client(**self.POOL_OPTIONS)
-        self.addCleanup(client.close)
-        pool_opts = get_pool(client).opts
+        client = self.rs_or_single_client(**self.POOL_OPTIONS)
+        pool_opts = (get_pool(client)).opts
         self.assertEqual(pool_opts.non_default_options, self.POOL_OPTIONS)
 
     def test_2_all_client_pools_have_same_options(self):
-        client = rs_or_single_client(**self.POOL_OPTIONS)
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client(**self.POOL_OPTIONS)
         client.admin.command("ping")
         # Discover at least one secondary.
         if client_context.has_secondaries:
@@ -340,15 +340,13 @@ class TestCMAP(IntegrationTest):
     def test_3_uri_connection_pool_options(self):
         opts = "&".join([f"{k}={v}" for k, v in self.POOL_OPTIONS.items()])
         uri = f"mongodb://{client_context.pair}/?{opts}"
-        client = rs_or_single_client(uri)
-        self.addCleanup(client.close)
-        pool_opts = get_pool(client).opts
+        client = self.rs_or_single_client(uri)
+        pool_opts = (get_pool(client)).opts
         self.assertEqual(pool_opts.non_default_options, self.POOL_OPTIONS)
 
     def test_4_subscribe_to_events(self):
         listener = CMAPListener()
-        client = single_client(event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.single_client(event_listeners=[listener])
         self.assertEqual(listener.event_count(PoolCreatedEvent), 1)
 
         # Creates a new connection.
@@ -371,8 +369,7 @@ class TestCMAP(IntegrationTest):
 
     def test_5_check_out_fails_connection_error(self):
         listener = CMAPListener()
-        client = single_client(event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.single_client(event_listeners=[listener])
         pool = get_pool(client)
 
         def mock_connect(*args, **kwargs):
@@ -395,12 +392,12 @@ class TestCMAP(IntegrationTest):
         failed_event = listener.events[3]
         self.assertEqual(failed_event.reason, ConnectionCheckOutFailedReason.CONN_ERROR)
 
+    @client_context.require_no_fips
     def test_5_check_out_fails_auth_error(self):
         listener = CMAPListener()
-        client = single_client_noauth(
+        client = self.single_client_noauth(
             username="notauser", password="fail", event_listeners=[listener]
         )
-        self.addCleanup(client.close)
 
         # Attempt to create a new connection.
         with self.assertRaisesRegex(OperationFailure, "failed"):
@@ -443,7 +440,7 @@ class TestCMAP(IntegrationTest):
 
     def test_close_leaves_pool_unpaused(self):
         listener = CMAPListener()
-        client = single_client(event_listeners=[listener])
+        client = self.single_client(event_listeners=[listener])
         client.admin.command("ping")
         pool = get_pool(client)
         client.close()

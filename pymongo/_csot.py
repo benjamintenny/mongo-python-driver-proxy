@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import time
 from collections import deque
 from contextlib import AbstractContextManager
@@ -74,14 +75,13 @@ class _TimeoutContext(AbstractContextManager):
         self._timeout = timeout
         self._tokens: Optional[tuple[Token[Optional[float]], Token[float], Token[float]]] = None
 
-    def __enter__(self) -> _TimeoutContext:
+    def __enter__(self) -> None:
         timeout_token = TIMEOUT.set(self._timeout)
         prev_deadline = DEADLINE.get()
         next_deadline = time.monotonic() + self._timeout if self._timeout else float("inf")
         deadline_token = DEADLINE.set(min(prev_deadline, next_deadline))
         rtt_token = RTT.set(0.0)
         self._tokens = (timeout_token, deadline_token, rtt_token)
-        return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._tokens:
@@ -96,16 +96,27 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def apply(func: F) -> F:
-    """Apply the client's timeoutMS to this operation."""
+    """Apply the client's timeoutMS to this operation. Can wrap both asynchronous and synchronous methods"""
+    if inspect.iscoroutinefunction(func):
 
-    @functools.wraps(func)
-    def csot_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if get_timeout() is None:
-            timeout = self._timeout
-            if timeout is not None:
-                with _TimeoutContext(timeout):
-                    return func(self, *args, **kwargs)
-        return func(self, *args, **kwargs)
+        @functools.wraps(func)
+        async def csot_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if get_timeout() is None:
+                timeout = self._timeout
+                if timeout is not None:
+                    with _TimeoutContext(timeout):
+                        return await func(self, *args, **kwargs)
+            return await func(self, *args, **kwargs)
+    else:
+
+        @functools.wraps(func)
+        def csot_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if get_timeout() is None:
+                timeout = self._timeout
+                if timeout is not None:
+                    with _TimeoutContext(timeout):
+                        return func(self, *args, **kwargs)
+            return func(self, *args, **kwargs)
 
     return cast(F, csot_wrapper)
 
@@ -137,10 +148,7 @@ class MovingMinimum:
 
     def add_sample(self, sample: float) -> None:
         if sample < 0:
-            # Likely system time change while waiting for hello response
-            # and not using time.monotonic. Ignore it, the next one will
-            # probably be valid.
-            return
+            raise ValueError(f"duration cannot be negative {sample}")
         self.samples.append(sample)
 
     def get(self) -> float:

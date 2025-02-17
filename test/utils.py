@@ -15,10 +15,12 @@
 """Utilities for testing pymongo"""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import functools
 import os
+import random
 import re
 import shutil
 import sys
@@ -26,22 +28,24 @@ import threading
 import time
 import unittest
 import warnings
+from asyncio import iscoroutinefunction
 from collections import abc, defaultdict
 from functools import partial
 from test import client_context, db_pwd, db_user
+from test.asynchronous import async_client_context
 from typing import Any, List
 
 from bson import json_util
 from bson.objectid import ObjectId
 from bson.son import SON
-from pymongo import MongoClient, monitoring, operations, read_preferences
-from pymongo.collection import ReturnDocument
-from pymongo.cursor import CursorType
+from pymongo import AsyncMongoClient, monitoring, operations, read_preferences
+from pymongo._asyncio_task import create_task
+from pymongo.cursor_shared import CursorType
 from pymongo.errors import ConfigurationError, OperationFailure
 from pymongo.hello import HelloCompat
-from pymongo.lock import _create_lock
+from pymongo.helpers_shared import _SENSITIVE_COMMANDS
+from pymongo.lock import _async_create_lock, _create_lock
 from pymongo.monitoring import (
-    _SENSITIVE_COMMANDS,
     ConnectionCheckedInEvent,
     ConnectionCheckedOutEvent,
     ConnectionCheckOutFailedEvent,
@@ -55,11 +59,13 @@ from pymongo.monitoring import (
     PoolReadyEvent,
 )
 from pymongo.operations import _Op
-from pymongo.pool import _CancellationContext, _PoolGeneration
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference
 from pymongo.server_selectors import any_server_selector, writable_server_selector
 from pymongo.server_type import SERVER_TYPE
+from pymongo.synchronous.collection import ReturnDocument
+from pymongo.synchronous.mongo_client import MongoClient
+from pymongo.synchronous.pool import _CancellationContext, _PoolGeneration
 from pymongo.uri_parser import parse_uri
 from pymongo.write_concern import WriteConcern
 
@@ -93,6 +99,12 @@ class BaseListener:
     def wait_for_event(self, event, count):
         """Wait for a number of events to be published, or fail."""
         wait_until(lambda: self.event_count(event) >= count, f"find {count} {event} event(s)")
+
+    async def async_wait_for_event(self, event, count):
+        """Wait for a number of events to be published, or fail."""
+        await async_wait_until(
+            lambda: self.event_count(event) >= count, f"find {count} {event} event(s)"
+        )
 
 
 class CMAPListener(BaseListener, monitoring.ConnectionPoolListener):
@@ -301,10 +313,27 @@ class HeartbeatEventsListListener(HeartbeatEventListener):
         self.event_list.append("serverHeartbeatFailedEvent")
 
 
+class AsyncMockConnection:
+    def __init__(self):
+        self.cancel_context = _CancellationContext()
+        self.more_to_come = False
+        self.id = random.randint(0, 100)
+
+    def close_conn(self, reason):
+        pass
+
+    def __aenter__(self):
+        return self
+
+    def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 class MockConnection:
     def __init__(self):
         self.cancel_context = _CancellationContext()
         self.more_to_come = False
+        self.id = random.randint(0, 100)
 
     def close_conn(self, reason):
         pass
@@ -313,6 +342,47 @@ class MockConnection:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+class AsyncMockPool:
+    def __init__(self, address, options, handshake=True, client_id=None):
+        self.gen = _PoolGeneration()
+        self._lock = _async_create_lock()
+        self.opts = options
+        self.operation_count = 0
+        self.conns = []
+
+    def stale_generation(self, gen, service_id):
+        return self.gen.stale(gen, service_id)
+
+    @contextlib.asynccontextmanager
+    async def checkout(self, handler=None):
+        yield AsyncMockConnection()
+
+    async def checkin(self, *args, **kwargs):
+        pass
+
+    async def _reset(self, service_id=None):
+        async with self._lock:
+            self.gen.inc(service_id)
+
+    async def ready(self):
+        pass
+
+    async def reset(self, service_id=None, interrupt_connections=False):
+        await self._reset()
+
+    async def reset_without_pause(self):
+        await self._reset()
+
+    async def close(self):
+        await self._reset()
+
+    async def update_is_writable(self, is_writable):
+        pass
+
+    async def remove_stale_sockets(self, *args, **kwargs):
         pass
 
 
@@ -414,222 +484,6 @@ class FunctionCallRecorder:
         return len(self._call_list)
 
 
-class SpecTestCreator:
-    """Class to create test cases from specifications."""
-
-    def __init__(self, create_test, test_class, test_path):
-        """Create a TestCreator object.
-
-        :Parameters:
-          - `create_test`: callback that returns a test case. The callback
-            must accept the following arguments - a dictionary containing the
-            entire test specification (the `scenario_def`), a dictionary
-            containing the specification for which the test case will be
-            generated (the `test_def`).
-          - `test_class`: the unittest.TestCase class in which to create the
-            test case.
-          - `test_path`: path to the directory containing the JSON files with
-            the test specifications.
-        """
-        self._create_test = create_test
-        self._test_class = test_class
-        self.test_path = test_path
-
-    def _ensure_min_max_server_version(self, scenario_def, method):
-        """Test modifier that enforces a version range for the server on a
-        test case.
-        """
-        if "minServerVersion" in scenario_def:
-            min_ver = tuple(int(elt) for elt in scenario_def["minServerVersion"].split("."))
-            if min_ver is not None:
-                method = client_context.require_version_min(*min_ver)(method)
-
-        if "maxServerVersion" in scenario_def:
-            max_ver = tuple(int(elt) for elt in scenario_def["maxServerVersion"].split("."))
-            if max_ver is not None:
-                method = client_context.require_version_max(*max_ver)(method)
-
-        if "serverless" in scenario_def:
-            serverless = scenario_def["serverless"]
-            if serverless == "require":
-                serverless_satisfied = client_context.serverless
-            elif serverless == "forbid":
-                serverless_satisfied = not client_context.serverless
-            else:  # unset or "allow"
-                serverless_satisfied = True
-            method = unittest.skipUnless(
-                serverless_satisfied, "Serverless requirement not satisfied"
-            )(method)
-
-        return method
-
-    @staticmethod
-    def valid_topology(run_on_req):
-        return client_context.is_topology_type(
-            run_on_req.get("topology", ["single", "replicaset", "sharded", "load-balanced"])
-        )
-
-    @staticmethod
-    def min_server_version(run_on_req):
-        version = run_on_req.get("minServerVersion")
-        if version:
-            min_ver = tuple(int(elt) for elt in version.split("."))
-            return client_context.version >= min_ver
-        return True
-
-    @staticmethod
-    def max_server_version(run_on_req):
-        version = run_on_req.get("maxServerVersion")
-        if version:
-            max_ver = tuple(int(elt) for elt in version.split("."))
-            return client_context.version <= max_ver
-        return True
-
-    @staticmethod
-    def valid_auth_enabled(run_on_req):
-        if "authEnabled" in run_on_req:
-            if run_on_req["authEnabled"]:
-                return client_context.auth_enabled
-            return not client_context.auth_enabled
-        return True
-
-    @staticmethod
-    def serverless_ok(run_on_req):
-        serverless = run_on_req["serverless"]
-        if serverless == "require":
-            return client_context.serverless
-        elif serverless == "forbid":
-            return not client_context.serverless
-        else:  # unset or "allow"
-            return True
-
-    def should_run_on(self, scenario_def):
-        run_on = scenario_def.get("runOn", [])
-        if not run_on:
-            # Always run these tests.
-            return True
-
-        for req in run_on:
-            if (
-                self.valid_topology(req)
-                and self.min_server_version(req)
-                and self.max_server_version(req)
-                and self.valid_auth_enabled(req)
-                and self.serverless_ok(req)
-            ):
-                return True
-        return False
-
-    def ensure_run_on(self, scenario_def, method):
-        """Test modifier that enforces a 'runOn' on a test case."""
-        return client_context._require(
-            lambda: self.should_run_on(scenario_def), "runOn not satisfied", method
-        )
-
-    def tests(self, scenario_def):
-        """Allow CMAP spec test to override the location of test."""
-        return scenario_def["tests"]
-
-    def create_tests(self):
-        for dirpath, _, filenames in os.walk(self.test_path):
-            dirname = os.path.split(dirpath)[-1]
-
-            for filename in filenames:
-                with open(os.path.join(dirpath, filename)) as scenario_stream:
-                    # Use tz_aware=False to match how CodecOptions decodes
-                    # dates.
-                    opts = json_util.JSONOptions(tz_aware=False)
-                    scenario_def = ScenarioDict(
-                        json_util.loads(scenario_stream.read(), json_options=opts)
-                    )
-
-                test_type = os.path.splitext(filename)[0]
-
-                # Construct test from scenario.
-                for test_def in self.tests(scenario_def):
-                    test_name = "test_{}_{}_{}".format(
-                        dirname,
-                        test_type.replace("-", "_").replace(".", "_"),
-                        str(test_def["description"].replace(" ", "_").replace(".", "_")),
-                    )
-
-                    new_test = self._create_test(scenario_def, test_def, test_name)
-                    new_test = self._ensure_min_max_server_version(scenario_def, new_test)
-                    new_test = self.ensure_run_on(scenario_def, new_test)
-
-                    new_test.__name__ = test_name
-                    setattr(self._test_class, new_test.__name__, new_test)
-
-
-def _connection_string(h):
-    if h.startswith(("mongodb://", "mongodb+srv://")):
-        return h
-    return f"mongodb://{h!s}"
-
-
-def _mongo_client(host, port, authenticate=True, directConnection=None, **kwargs):
-    """Create a new client over SSL/TLS if necessary."""
-    host = host or client_context.host
-    port = port or client_context.port
-    client_options: dict = client_context.default_client_options.copy()
-    if client_context.replica_set_name and not directConnection:
-        client_options["replicaSet"] = client_context.replica_set_name
-    if directConnection is not None:
-        client_options["directConnection"] = directConnection
-    client_options.update(kwargs)
-
-    uri = _connection_string(host)
-    auth_mech = kwargs.get("authMechanism", "")
-    if client_context.auth_enabled and authenticate and auth_mech != "MONGODB-OIDC":
-        # Only add the default username or password if one is not provided.
-        res = parse_uri(uri)
-        if (
-            not res["username"]
-            and not res["password"]
-            and "username" not in client_options
-            and "password" not in client_options
-        ):
-            client_options["username"] = db_user
-            client_options["password"] = db_pwd
-    return MongoClient(uri, port, **client_options)
-
-
-def single_client_noauth(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
-    """Make a direct connection. Don't authenticate."""
-    return _mongo_client(h, p, authenticate=False, directConnection=True, **kwargs)
-
-
-def single_client(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
-    """Make a direct connection, and authenticate if necessary."""
-    return _mongo_client(h, p, directConnection=True, **kwargs)
-
-
-def rs_client_noauth(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
-    """Connect to the replica set. Don't authenticate."""
-    return _mongo_client(h, p, authenticate=False, **kwargs)
-
-
-def rs_client(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
-    """Connect to the replica set and authenticate if necessary."""
-    return _mongo_client(h, p, **kwargs)
-
-
-def rs_or_single_client_noauth(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
-    """Connect to the replica set if there is one, otherwise the standalone.
-
-    Like rs_or_single_client, but does not authenticate.
-    """
-    return _mongo_client(h, p, authenticate=False, **kwargs)
-
-
-def rs_or_single_client(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[Any]:
-    """Connect to the replica set if there is one, otherwise the standalone.
-
-    Authenticates if necessary.
-    """
-    return _mongo_client(h, p, **kwargs)
-
-
 def ensure_all_connected(client: MongoClient) -> None:
     """Ensure that the client's connection pool has socket connections to all
     members of a replica set. Raises ConfigurationError when called with a
@@ -658,6 +512,44 @@ def ensure_all_connected(client: MongoClient) -> None:
 
     try:
         wait_until(lambda: target_host_list == discover(), "connected to all hosts")
+    except AssertionError as exc:
+        raise AssertionError(
+            f"{exc}, {connected_host_list} != {target_host_list}, {client.topology_description}"
+        )
+
+
+async def async_ensure_all_connected(client: AsyncMongoClient) -> None:
+    """Ensure that the client's connection pool has socket connections to all
+    members of a replica set. Raises ConfigurationError when called with a
+    non-replica set client.
+
+    Depending on the use-case, the caller may need to clear any event listeners
+    that are configured on the client.
+    """
+    hello: dict = await client.admin.command(HelloCompat.LEGACY_CMD)
+    if "setName" not in hello:
+        raise ConfigurationError("cluster is not a replica set")
+
+    target_host_list = set(hello["hosts"] + hello.get("passives", []))
+    connected_host_list = {hello["me"]}
+
+    # Run hello until we have connected to each host at least once.
+    async def discover():
+        i = 0
+        while i < 100 and connected_host_list != target_host_list:
+            hello: dict = await client.admin.command(
+                HelloCompat.LEGACY_CMD, read_preference=ReadPreference.SECONDARY
+            )
+            connected_host_list.update([hello["me"]])
+            i += 1
+        return connected_host_list
+
+    try:
+
+        async def predicate():
+            return target_host_list == await discover()
+
+        await async_wait_until(predicate, "connected to all hosts")
     except AssertionError as exc:
         raise AssertionError(
             f"{exc}, {connected_host_list} != {target_host_list}, {client.topology_description}"
@@ -767,16 +659,6 @@ def server_started_with_auth(client):
     return "--auth" in argv or "--keyFile" in argv
 
 
-def drop_collections(db):
-    # Drop all non-system collections in this database.
-    for coll in db.list_collection_names(filter={"name": {"$regex": r"^(?!system\.)"}}):
-        db.drop_collection(coll)
-
-
-def remove_all_users(db):
-    db.command("dropAllUsersFromDatabase", 1, writeConcern={"w": client_context.w})
-
-
 def joinall(threads):
     """Join threads with a 5-minute timeout, assert joins succeeded"""
     for t in threads:
@@ -784,15 +666,9 @@ def joinall(threads):
         assert not t.is_alive(), "Thread %s hung" % t
 
 
-def connected(client):
-    """Convenience to wait for a newly-constructed client to connect."""
-    with warnings.catch_warnings():
-        # Ignore warning that ping is always routed to primary even
-        # if client's read preference isn't PRIMARY.
-        warnings.simplefilter("ignore", UserWarning)
-        client.admin.command("ping")  # Force connection.
-
-    return client
+async def async_joinall(tasks):
+    """Join threads with a 5-minute timeout, assert joins succeeded"""
+    await asyncio.wait([t.task for t in tasks if t is not None], timeout=300)
 
 
 def wait_until(predicate, success_description, timeout=10):
@@ -821,18 +697,42 @@ def wait_until(predicate, success_description, timeout=10):
         time.sleep(interval)
 
 
-def repl_set_step_down(client, **kwargs):
-    """Run replSetStepDown, first unfreezing a secondary with replSetFreeze."""
-    cmd = SON([("replSetStepDown", 1)])
-    cmd.update(kwargs)
+async def async_wait_until(predicate, success_description, timeout=10):
+    """Wait up to 10 seconds (by default) for predicate to be true.
 
-    # Unfreeze a secondary to ensure a speedy election.
-    client.admin.command("replSetFreeze", 0, read_preference=ReadPreference.SECONDARY)
-    client.admin.command(cmd)
+    E.g.:
+
+        wait_until(lambda: client.primary == ('a', 1),
+                   'connect to the primary')
+
+    If the lambda-expression isn't true after 10 seconds, we raise
+    AssertionError("Didn't ever connect to the primary").
+
+    Returns the predicate's first true value.
+    """
+    start = time.time()
+    interval = min(float(timeout) / 100, 0.1)
+    while True:
+        if iscoroutinefunction(predicate):
+            retval = await predicate()
+        else:
+            retval = predicate()
+        if retval:
+            return retval
+
+        if time.time() - start > timeout:
+            raise AssertionError("Didn't ever %s" % success_description)
+
+        await asyncio.sleep(interval)
 
 
 def is_mongos(client):
     res = client.admin.command(HelloCompat.LEGACY_CMD)
+    return res.get("msg", "") == "isdbgrid"
+
+
+async def async_is_mongos(client):
+    res = await client.admin.command(HelloCompat.LEGACY_CMD)
     return res.get("msg", "") == "isdbgrid"
 
 
@@ -850,6 +750,20 @@ def assertRaisesExactly(cls, fn, *args, **kwargs):
         raise AssertionError("%s not raised" % cls)
 
 
+async def asyncAssertRaisesExactly(cls, fn, *args, **kwargs):
+    """
+    Unlike the standard assertRaises, this checks that a function raises a
+    specific class of exception, and not a subclass. E.g., check that
+    MongoClient() raises ConnectionFailure but not its subclass, AutoReconnect.
+    """
+    try:
+        await fn(*args, **kwargs)
+    except Exception as e:
+        assert e.__class__ == cls, f"got {e.__class__.__name__}, expected {cls.__name__}"
+    else:
+        raise AssertionError("%s not raised" % cls)
+
+
 @contextlib.contextmanager
 def _ignore_deprecations():
     with warnings.catch_warnings():
@@ -860,11 +774,18 @@ def _ignore_deprecations():
 def ignore_deprecations(wrapped=None):
     """A context manager or a decorator."""
     if wrapped:
+        if iscoroutinefunction(wrapped):
 
-        @functools.wraps(wrapped)
-        def wrapper(*args, **kwargs):
-            with _ignore_deprecations():
-                return wrapped(*args, **kwargs)
+            @functools.wraps(wrapped)
+            async def wrapper(*args, **kwargs):
+                with _ignore_deprecations():
+                    return await wrapped(*args, **kwargs)
+        else:
+
+            @functools.wraps(wrapped)
+            def wrapper(*args, **kwargs):
+                with _ignore_deprecations():
+                    return wrapped(*args, **kwargs)
 
         return wrapper
 
@@ -888,7 +809,14 @@ class DeprecationFilter:
 def get_pool(client):
     """Get the standalone, primary, or mongos pool."""
     topology = client._get_topology()
-    server = topology.select_server(writable_server_selector, _Op.TEST)
+    server = topology._select_server(writable_server_selector, _Op.TEST)
+    return server.pool
+
+
+async def async_get_pool(client):
+    """Get the standalone, primary, or mongos pool."""
+    topology = await client._get_topology()
+    server = await topology._select_server(writable_server_selector, _Op.TEST)
     return server.pool
 
 
@@ -897,6 +825,16 @@ def get_pools(client):
     return [
         server.pool
         for server in client._get_topology().select_servers(any_server_selector, _Op.TEST)
+    ]
+
+
+async def async_get_pools(client):
+    """Get all pools."""
+    return [
+        server.pool
+        for server in await (await client._get_topology()).select_servers(
+            any_server_selector, _Op.TEST
+        )
     ]
 
 
@@ -980,35 +918,6 @@ def is_greenthread_patched():
     return gevent_monkey_patched() or eventlet_monkey_patched()
 
 
-def disable_replication(client):
-    """Disable replication on all secondaries."""
-    for host, port in client.secondaries:
-        secondary = single_client(host, port)
-        secondary.admin.command("configureFailPoint", "stopReplProducer", mode="alwaysOn")
-
-
-def enable_replication(client):
-    """Enable replication on all secondaries."""
-    for host, port in client.secondaries:
-        secondary = single_client(host, port)
-        secondary.admin.command("configureFailPoint", "stopReplProducer", mode="off")
-
-
-class ExceptionCatchingThread(threading.Thread):
-    """A thread that stores any exception encountered from run()."""
-
-    def __init__(self, *args, **kwargs):
-        self.exc = None
-        super().__init__(*args, **kwargs)
-
-    def run(self):
-        try:
-            super().run()
-        except BaseException as exc:
-            self.exc = exc
-            raise
-
-
 def parse_read_preference(pref):
     # Make first letter lowercase to match read_pref's modes.
     mode_string = pref.get("mode", "primary")
@@ -1073,45 +982,12 @@ def parse_spec_options(opts):
     if "maxCommitTimeMS" in opts:
         opts["max_commit_time_ms"] = opts.pop("maxCommitTimeMS")
 
-    if "hint" in opts:
-        hint = opts.pop("hint")
-        if not isinstance(hint, str):
-            hint = list(hint.items())
-        opts["hint"] = hint
-
-    # Properly format 'hint' arguments for the Bulk API tests.
-    if "requests" in opts:
-        reqs = opts.pop("requests")
-        for req in reqs:
-            if "name" in req:
-                # CRUD v2 format
-                args = req.pop("arguments", {})
-                if "hint" in args:
-                    hint = args.pop("hint")
-                    if not isinstance(hint, str):
-                        hint = list(hint.items())
-                    args["hint"] = hint
-                req["arguments"] = args
-            else:
-                # Unified test format
-                bulk_model, spec = next(iter(req.items()))
-                if "hint" in spec:
-                    hint = spec.pop("hint")
-                    if not isinstance(hint, str):
-                        hint = list(hint.items())
-                    spec["hint"] = hint
-        opts["requests"] = reqs
-
     return dict(opts)
 
 
 def prepare_spec_arguments(spec, arguments, opname, entity_map, with_txn_callback):
     for arg_name in list(arguments):
         c2s = camel_to_snake(arg_name)
-        # PyMongo accepts sort as list of tuples.
-        if arg_name == "sort":
-            sort_dict = arguments[arg_name]
-            arguments[arg_name] = list(sort_dict.items())
         # Named "key" instead not fieldName.
         if arg_name == "fieldName":
             arguments["key"] = arguments.pop(arg_name)
@@ -1123,10 +999,10 @@ def prepare_spec_arguments(spec, arguments, opname, entity_map, with_txn_callbac
         # Requires boolean returnDocument.
         elif arg_name == "returnDocument":
             arguments[c2s] = getattr(ReturnDocument, arguments.pop(arg_name).upper())
-        elif c2s == "requests":
+        elif "bulk_write" in opname and (c2s == "requests" or c2s == "models"):
             # Parse each request into a bulk write model.
             requests = []
-            for request in arguments["requests"]:
+            for request in arguments[c2s]:
                 if "name" in request:
                     # CRUD v2 format
                     bulk_model = camel_to_upper_camel(request["name"])
@@ -1138,7 +1014,7 @@ def prepare_spec_arguments(spec, arguments, opname, entity_map, with_txn_callbac
                     bulk_class = getattr(operations, camel_to_upper_camel(bulk_model))
                     bulk_arguments = camel_to_snake_args(spec)
                 requests.append(bulk_class(**dict(bulk_arguments)))
-            arguments["requests"] = requests
+            arguments[c2s] = requests
         elif arg_name == "session":
             arguments["session"] = entity_map[arguments["session"]]
         elif opname == "open_download_stream" and arg_name == "id":
@@ -1188,3 +1064,17 @@ def set_fail_point(client, command_args):
     cmd = SON([("configureFailPoint", "failCommand")])
     cmd.update(command_args)
     client.admin.command(cmd)
+
+
+async def async_set_fail_point(client, command_args):
+    cmd = SON([("configureFailPoint", "failCommand")])
+    cmd.update(command_args)
+    await client.admin.command(cmd)
+
+
+def create_async_event():
+    return asyncio.Event()
+
+
+def create_event():
+    return threading.Event()

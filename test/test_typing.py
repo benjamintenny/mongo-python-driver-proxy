@@ -15,6 +15,7 @@
 """Test that each file in mypy_fails/ actually fails mypy, and test some
 sample client code that uses PyMongo typings.
 """
+
 from __future__ import annotations
 
 import os
@@ -34,10 +35,11 @@ from typing import (
     cast,
 )
 
-try:
+if TYPE_CHECKING:
     from typing_extensions import NotRequired, TypedDict
 
-    from bson import ObjectId
+    from bson import Binary, ObjectId
+    from bson.binary import BinaryVector, BinaryVectorDtype
 
     class Movie(TypedDict):
         name: str
@@ -49,16 +51,13 @@ try:
         year: int
 
     class ImplicitMovie(TypedDict):
-        _id: NotRequired[ObjectId]  # pyright: ignore[reportGeneralTypeIssues]
+        _id: NotRequired[ObjectId]
         name: str
         year: int
-
-except ImportError:
-    Movie = dict  # type:ignore[misc,assignment]
-    ImplicitMovie = dict  # type: ignore[assignment,misc]
-    MovieWithId = dict  # type: ignore[assignment,misc]
-    TypedDict = None
-    NotRequired = None  # type: ignore[assignment]
+else:
+    Movie = dict
+    ImplicitMovie = dict
+    NotRequired = None
 
 
 try:
@@ -68,16 +67,15 @@ except ImportError:
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, client_context
-from test.utils import rs_or_single_client
+from test import IntegrationTest, PyMongoTestCase, client_context
 
 from bson import CodecOptions, decode, decode_all, decode_file_iter, decode_iter, encode
 from bson.raw_bson import RawBSONDocument
 from bson.son import SON
 from pymongo import ASCENDING, MongoClient
-from pymongo.collection import Collection
 from pymongo.operations import DeleteOne, InsertOne, ReplaceOne
 from pymongo.read_preferences import ReadPreference
+from pymongo.synchronous.collection import Collection
 
 TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mypy_fails")
 
@@ -118,10 +116,9 @@ class TestMypyFails(unittest.TestCase):
 class TestPymongo(IntegrationTest):
     coll: Collection
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.coll = cls.client.test.test
+    def setUp(self):
+        super().setUp()
+        self.coll = self.client.test.test
 
     def test_insert_find(self) -> None:
         doc = {"my": "doc"}
@@ -194,7 +191,7 @@ class TestPymongo(IntegrationTest):
         value.items()
 
     def test_default_document_type(self) -> None:
-        client = rs_or_single_client()
+        client = self.rs_or_single_client()
         self.addCleanup(client.close)
         coll = client.test.test
         doc = {"my": "doc"}
@@ -234,6 +231,19 @@ class TestPymongo(IntegrationTest):
             return session.with_transaction(
                 execute_transaction, read_preference=ReadPreference.PRIMARY
             )
+
+    def test_with_options(self) -> None:
+        coll: Collection[Dict[str, Any]] = self.coll
+        coll.drop()
+        doc = {"name": "foo", "year": 1982, "other": 1}
+        coll.insert_one(doc)
+
+        coll2 = coll.with_options(codec_options=CodecOptions(document_class=Movie))
+        retrieved = coll2.find_one()
+        assert retrieved is not None
+        assert retrieved["name"] == "foo"
+        # We expect a type error here.
+        assert retrieved["other"] == 1  # type:ignore[typeddict-item]
 
 
 class TestDecode(unittest.TestCase):
@@ -366,7 +376,7 @@ class TestDecode(unittest.TestCase):
         doc["a"] = 2
 
 
-class TestDocumentType(unittest.TestCase):
+class TestDocumentType(PyMongoTestCase):
     @only_type_check
     def test_default(self) -> None:
         client: MongoClient = MongoClient()
@@ -427,7 +437,7 @@ class TestDocumentType(unittest.TestCase):
         )
         coll.bulk_write(
             [
-                InsertOne({"_id": ObjectId(), "name": "THX-1138", "year": 1971})
+                InsertOne({"_id": ObjectId(), "name": "THX-1138", "year": 1971})  # pyright: ignore
             ]  # No error because it is in-line.
         )
 
@@ -444,7 +454,7 @@ class TestDocumentType(unittest.TestCase):
         )
         coll.bulk_write(
             [
-                ReplaceOne({}, {"_id": ObjectId(), "name": "THX-1138", "year": 1971})
+                ReplaceOne({}, {"_id": ObjectId(), "name": "THX-1138", "year": 1971})  # pyright: ignore
             ]  # No error because it is in-line.
         )
 
@@ -480,7 +490,7 @@ class TestDocumentType(unittest.TestCase):
     def test_typeddict_find_notrequired(self):
         if NotRequired is None or ImplicitMovie is None:
             raise unittest.SkipTest("Python 3.11+ is required to use NotRequired.")
-        client: MongoClient[ImplicitMovie] = rs_or_single_client()
+        client: MongoClient[ImplicitMovie] = self.rs_or_single_client()
         coll = client.test.test
         coll.insert_one(ImplicitMovie(name="THX-1138", year=1971))
         out = coll.find_one({})
@@ -567,7 +577,7 @@ class TestCodecOptionsDocumentType(unittest.TestCase):
     def test_typeddict_document_type(self) -> None:
         options: CodecOptions[Movie] = CodecOptions()
         # Suppress: Cannot instantiate type "Type[Movie]".
-        obj = options.document_class(name="a", year=1)  # type: ignore[misc]
+        obj = options.document_class(name="a", year=1)
         assert obj["year"] == 1
         assert obj["name"] == "a"
 
@@ -581,6 +591,23 @@ class TestCodecOptionsDocumentType(unittest.TestCase):
         options = CodecOptions(SON[str, Any])
         obj = options.document_class()
         obj["a"] = 1
+
+
+class TestBSONFromVectorType(unittest.TestCase):
+    @only_type_check
+    def test_from_vector_binaryvector(self):
+        list_vector = BinaryVector([127, 7], BinaryVectorDtype.INT8)
+        Binary.from_vector(list_vector)
+
+    @only_type_check
+    def test_from_vector_list_int(self):
+        list_vector = [127, 7]
+        Binary.from_vector(list_vector, BinaryVectorDtype.INT8)
+
+    @only_type_check
+    def test_from_vector_list_float(self):
+        list_vector = [127.0, 7.0]
+        Binary.from_vector(list_vector, BinaryVectorDtype.INT8)
 
 
 if __name__ == "__main__":

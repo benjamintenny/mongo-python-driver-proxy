@@ -16,7 +16,7 @@ be of interest or that has already been addressed.
 
 ## Supported Interpreters
 
-PyMongo supports CPython 3.8+ and PyPy3.9+. Language features not
+PyMongo supports CPython 3.9+ and PyPy3.10+. Language features not
 supported by all interpreters can not be used.
 
 ## Style Guide
@@ -28,8 +28,10 @@ including 4 space indents and 79 character line limits.
 
 -   Avoid backward breaking changes if at all possible.
 -   Write inline documentation for new classes and methods.
+-   We use [uv](https://docs.astral.sh/uv/) for python environment management and packaging.
+-   We use [just](https://just.systems/man/en/) as our task runner.
 -   Write tests and make sure they pass (make sure you have a mongod
-    running on the default port, then execute `tox -e test` from the cmd
+    running on the default port, then execute `just test` from the cmd
     line to run the test suite).
 -   Add yourself to doc/contributors.rst `:)`
 
@@ -147,28 +149,26 @@ To run `pre-commit` manually, run:
 pre-commit run --all-files
 ```
 
-To run a manual hook like `mypy` manually, run:
+To run a manual hook like `ruff` manually, run:
 
 ```bash
-pre-commit run --all-files --hook-stage manual mypy
+pre-commit run --all-files --hook-stage manual ruff
 ```
 
-Typically we use `tox` to run the linters, e.g.
+Typically we use `just` to run the linters, e.g.
 
 ```bash
-tox -e typecheck-mypy
-tox -e lint-manual
+just install  # this will install a venv with pre-commit installed, and install the pre-commit hook.
+just typing-mypy
+just run lint-manual
 ```
 
 ## Documentation
 
-To contribute to the [API
-documentation](https://pymongo.readthedocs.io/en/stable/) just make your
-changes to the inline documentation of the appropriate [source
-code](https://github.com/mongodb/mongo-python-driver) or [rst
-file](https://github.com/mongodb/mongo-python-driver/tree/master/doc) in
-a branch and submit a [pull
-request](https://help.github.com/articles/using-pull-requests). You
+To contribute to the [API documentation](https://pymongo.readthedocs.io/en/stable/) just make your
+changes to the inline documentation of the appropriate [source code](https://github.com/mongodb/mongo-python-driver) or
+[rst file](https://github.com/mongodb/mongo-python-driver/tree/master/doc) in
+a branch and submit a [pull request](https://help.github.com/articles/using-pull-requests). You
 might also use the GitHub
 [Edit](https://github.com/blog/844-forking-with-the-edit-button) button.
 
@@ -178,13 +178,13 @@ documentation including narrative docs, and the [Sphinx docstring format](https:
 You can build the documentation locally by running:
 
 ```bash
-tox -e doc
+just docs
 ```
 
 When updating docs, it can be helpful to run the live docs server as:
 
 ```bash
-tox -e doc-serve
+just docs-serve
 ```
 
 Browse to the link provided, and then as you make changes to docstrings or narrative docs,
@@ -194,13 +194,14 @@ the pages will re-render and the browser will automatically refresh.
 ## Running Tests Locally
 
 -   Ensure you have started the appropriate Mongo Server(s).
--   Run `pip install tox` to use `tox` for testing or run
-    `pip install -e ".[test]"` to run `pytest` directly.
--   Run `tox -m test` or `pytest` to run all of the tests.
+-   Run `just install` to set a local virtual environment, or you can manually
+    create a virtual environment and run `pytest` directly.  If you want to use a specific
+    version of Python, remove the `.venv` folder and set `PYTHON_BINARY` before running `just install`.
+-   Run `just test` or `pytest` to run all of the tests.
 -   Append `test/<mod_name>.py::<class_name>::<test_name>` to run
     specific tests. You can omit the `<test_name>` to test a full class
     and the `<class_name>` to test a full module. For example:
-    `tox -m test -- test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_change_stream_errors_on_ElectionInProgress`.
+    `just test test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_change_stream_errors_on_ElectionInProgress`.
 -   Use the `-k` argument to select tests by pattern.
 
 ## Running Load Balancer Tests Locally
@@ -210,15 +211,18 @@ the pages will re-render and the browser will automatically refresh.
     `git clone git@github.com:mongodb-labs/drivers-evergreen-tools.git`.
 -   Start the servers using
     `LOAD_BALANCER=true TOPOLOGY=sharded_cluster AUTH=noauth SSL=nossl MONGODB_VERSION=6.0 DRIVERS_TOOLS=$PWD/drivers-evergreen-tools MONGO_ORCHESTRATION_HOME=$PWD/drivers-evergreen-tools/.evergreen/orchestration $PWD/drivers-evergreen-tools/.evergreen/run-orchestration.sh`.
--   Start the load balancer using:
-    `MONGODB_URI='mongodb://localhost:27017,localhost:27018/' $PWD/drivers-evergreen-tools/.evergreen/run-load-balancer.sh start`.
+-   Set up the test using:
+    `MONGODB_URI='mongodb://localhost:27017,localhost:27018/' TEST_LOADBALANCER=1 just setup-test`.
 -   Run the tests from the `pymongo` checkout directory using:
-    `TEST_LOADBALANCER=1 tox -m test-eg`.
+    `just test-eg`.
 
 ## Running Encryption Tests Locally
-- Run `AWS_PROFILE=<profile> tox -m setup-encryption` after setting up your AWS profile with `aws configure sso`.
-- Run the tests with `TEST_ENCRYPTION=1 tox -e test-eg`.
-- When done, run `tox -m teardown-encryption` to clean up.
+- Clone `drivers-evergreen-tools`:
+  `git clone git@github.com:mongodb-labs/drivers-evergreen-tools.git`.
+- Run `export DRIVERS_TOOLS=$PWD/drivers-evergreen-tools`
+- Run `TEST_ENCRYPTION=1 AWS_PROFILE=<profile> just setup-test` after setting up your AWS profile with `aws configure sso`.
+- Run the tests with `just test-eg`.
+- When done, run `just teardown-test` to clean up.
 
 ## Re-sync Spec Tests
 
@@ -240,3 +244,31 @@ The `-b` flag adds as a regex pattern to block files you do not wish to
 update in PyMongo. This is primarily helpful if you are implementing a
 new feature in PyMongo that has spec tests already implemented, or if
 you are attempting to validate new spec tests in PyMongo.
+
+## Making a Release
+
+Follow the [Python Driver Release Process Wiki](https://wiki.corp.mongodb.com/display/DRIVERS/Python+Driver+Release+Process).
+
+## Asyncio considerations
+
+PyMongo adds asyncio capability by modifying the source files in `*/asynchronous` to `*/synchronous` using
+[unasync](https://github.com/python-trio/unasync/) and some custom transforms.
+
+Where possible, edit the code in `*/asynchronous/*.py` and not the synchronous files.
+You can run `pre-commit run --all-files synchro` before running tests if you are testing synchronous code.
+
+To prevent the `synchro` hook from accidentally overwriting code, it first checks to see whether a sync version
+of a file is changing and not its async counterpart, and will fail.
+In the unlikely scenario that you want to override this behavior, first export `OVERRIDE_SYNCHRO_CHECK=1`.
+
+Sometimes, the `synchro` hook will fail and introduce changes many previously unmodified files. This is due to static
+Python errors, such as missing imports, incorrect syntax, or other fatal typos. To resolve these issues,
+run `pre-commit run --all-files --hook-stage manual ruff` and fix all reported errors before running the `synchro`
+hook again.
+
+## Converting a test to async
+The `tools/convert_test_to_async.py` script takes in an existing synchronous test file and outputs a
+partially-converted asynchronous version of the same name to the `test/asynchronous` directory.
+Use this generated file as a starting point for the completed conversion.
+
+The script is used like so: `python tools/convert_test_to_async.py [test_file.py]`

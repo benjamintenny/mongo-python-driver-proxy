@@ -18,12 +18,14 @@ import sys
 
 sys.path[0:0] = [""]
 
-from test import SkipTest, client_context, unittest
+from test import SkipTest, UnitTest, client_context, unittest
+
+_IS_SYNC = True
 
 
-class TestClientContext(unittest.TestCase):
+class TestClientContext(UnitTest):
     def test_must_connect(self):
-        if "PYMONGO_MUST_CONNECT" not in os.environ:
+        if not os.environ.get("PYMONGO_MUST_CONNECT"):
             raise SkipTest("PYMONGO_MUST_CONNECT is not set")
 
         self.assertTrue(
@@ -35,7 +37,7 @@ class TestClientContext(unittest.TestCase):
         )
 
     def test_serverless(self):
-        if "TEST_SERVERLESS" not in os.environ:
+        if not os.environ.get("TEST_SERVERLESS"):
             raise SkipTest("TEST_SERVERLESS is not set")
 
         self.assertTrue(
@@ -45,7 +47,7 @@ class TestClientContext(unittest.TestCase):
         )
 
     def test_enableTestCommands_is_disabled(self):
-        if "PYMONGO_DISABLE_TEST_COMMANDS" not in os.environ:
+        if not os.environ.get("PYMONGO_DISABLE_TEST_COMMANDS"):
             raise SkipTest("PYMONGO_DISABLE_TEST_COMMANDS is not set")
 
         self.assertFalse(
@@ -54,10 +56,17 @@ class TestClientContext(unittest.TestCase):
         )
 
     def test_setdefaultencoding_worked(self):
-        if "SETDEFAULTENCODING" not in os.environ:
+        if not os.environ.get("SETDEFAULTENCODING"):
             raise SkipTest("SETDEFAULTENCODING is not set")
 
         self.assertEqual(sys.getdefaultencoding(), os.environ["SETDEFAULTENCODING"])
+
+    def test_free_threading_is_enabled(self):
+        if "free-threading build" not in sys.version:
+            raise SkipTest("this test requires the Python free-threading build")
+
+        # If the GIL is enabled then pymongo or one of our deps does not support free-threading.
+        self.assertFalse(sys._is_gil_enabled())  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

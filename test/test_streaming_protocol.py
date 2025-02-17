@@ -24,13 +24,13 @@ from test import IntegrationTest, client_context, unittest
 from test.utils import (
     HeartbeatEventListener,
     ServerEventListener,
-    rs_or_single_client,
-    single_client,
     wait_until,
 )
 
 from pymongo import monitoring
 from pymongo.hello import HelloCompat
+
+_IS_SYNC = True
 
 
 class TestStreamingProtocol(IntegrationTest):
@@ -38,12 +38,11 @@ class TestStreamingProtocol(IntegrationTest):
     def test_failCommand_streaming(self):
         listener = ServerEventListener()
         hb_listener = HeartbeatEventListener()
-        client = rs_or_single_client(
+        client = self.rs_or_single_client(
             event_listeners=[listener, hb_listener],
             heartbeatFrequencyMS=500,
             appName="failingHeartbeatTest",
         )
-        self.addCleanup(client.close)
         # Force a connection.
         client.admin.command("ping")
         address = client.address
@@ -80,7 +79,7 @@ class TestStreamingProtocol(IntegrationTest):
             def rediscovered():
                 return len(listener.matching(_discovered_node)) >= 1
 
-            # Topology events are published asynchronously
+            # Topology events are not published synchronously
             wait_until(marked_unknown, "mark node unknown")
             wait_until(rediscovered, "rediscover node")
 
@@ -107,10 +106,9 @@ class TestStreamingProtocol(IntegrationTest):
             },
         }
         with self.fail_point(delay_hello):
-            client = rs_or_single_client(
+            client = self.rs_or_single_client(
                 event_listeners=[listener, hb_listener], heartbeatFrequencyMS=500, appName=name
             )
-            self.addCleanup(client.close)
             # Force a connection.
             client.admin.command("ping")
             address = client.address
@@ -141,11 +139,10 @@ class TestStreamingProtocol(IntegrationTest):
         self.assertEqual(1, len(events))
         self.assertGreater(events[0].new_description.round_trip_time, 0)
 
-    @client_context.require_version_min(4, 9, -1)
     @client_context.require_failCommand_appName
     def test_monitor_waits_after_server_check_error(self):
         # This test implements:
-        # https://github.com/mongodb/specifications/blob/6c5b2ac/source/server-discovery-and-monitoring/server-discovery-and-monitoring-tests.rst#monitors-sleep-at-least-minheartbeatfreqencyms-between-checks
+        # https://github.com/mongodb/specifications/blob/master/source/server-discovery-and-monitoring/server-discovery-and-monitoring-tests.md#monitors-sleep-at-least-minheartbeatfreqencyms-between-checks
         fail_hello = {
             "mode": {"times": 5},
             "data": {
@@ -156,10 +153,9 @@ class TestStreamingProtocol(IntegrationTest):
         }
         with self.fail_point(fail_hello):
             start = time.time()
-            client = single_client(
+            client = self.single_client(
                 appName="SDAMMinHeartbeatFrequencyTest", serverSelectionTimeoutMS=5000
             )
-            self.addCleanup(client.close)
             # Force a connection.
             client.admin.command("ping")
             duration = time.time() - start
@@ -181,12 +177,11 @@ class TestStreamingProtocol(IntegrationTest):
     @client_context.require_failCommand_appName
     def test_heartbeat_awaited_flag(self):
         hb_listener = HeartbeatEventListener()
-        client = single_client(
+        client = self.single_client(
             event_listeners=[hb_listener],
             heartbeatFrequencyMS=500,
             appName="heartbeatEventAwaitedFlag",
         )
-        self.addCleanup(client.close)
         # Force a connection.
         client.admin.command("ping")
 

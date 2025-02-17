@@ -19,48 +19,44 @@ import sys
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, client_context, unittest
+from test import (
+    IntegrationTest,
+    client_context,
+    unittest,
+)
+from test.helpers import repl_set_step_down
 from test.utils import (
     CMAPListener,
     ensure_all_connected,
-    repl_set_step_down,
-    rs_or_single_client,
 )
 
 from bson import SON
 from pymongo import monitoring
-from pymongo.collection import Collection
 from pymongo.errors import NotPrimaryError
+from pymongo.synchronous.collection import Collection
 from pymongo.write_concern import WriteConcern
+
+_IS_SYNC = True
 
 
 class TestConnectionsSurvivePrimaryStepDown(IntegrationTest):
     listener: CMAPListener
     coll: Collection
 
-    @classmethod
     @client_context.require_replica_set
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.listener = CMAPListener()
-        cls.client = rs_or_single_client(
-            event_listeners=[cls.listener], retryWrites=False, heartbeatFrequencyMS=500
+    def setUp(self):
+        super().setUp()
+        self.listener = CMAPListener()
+        self.client = self.rs_or_single_client(
+            event_listeners=[self.listener], retryWrites=False, heartbeatFrequencyMS=500
         )
 
         # Ensure connections to all servers in replica set. This is to test
         # that the is_writable flag is properly updated for connections that
         # survive a replica set election.
-        ensure_all_connected(cls.client)
-        cls.listener.reset()
-
-        cls.db = cls.client.get_database("step-down", write_concern=WriteConcern("majority"))
-        cls.coll = cls.db.get_collection("step-down", write_concern=WriteConcern("majority"))
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.client.close()
-
-    def setUp(self):
+        ensure_all_connected(self.client)
+        self.db = self.client.get_database("step-down", write_concern=WriteConcern("majority"))
+        self.coll = self.db.get_collection("step-down", write_concern=WriteConcern("majority"))
         # Note that all ops use same write-concern as self.db (majority).
         self.db.drop_collection("step-down")
         self.db.create_collection("step-down")

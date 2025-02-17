@@ -17,17 +17,22 @@ from __future__ import annotations
 
 import ipaddress
 import random
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from pymongo.common import CONNECT_TIMEOUT
 from pymongo.errors import ConfigurationError
 
-try:
+if TYPE_CHECKING:
     from dns import resolver
 
-    _HAVE_DNSPYTHON = True
-except ImportError:
-    _HAVE_DNSPYTHON = False
+
+def _have_dnspython() -> bool:
+    try:
+        import dns  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 # dnspython can return bytes or str from various parts
@@ -40,6 +45,8 @@ def maybe_decode(text: Union[str, bytes]) -> str:
 
 # PYTHON-2667 Lazily call dns.resolver methods for compatibility with eventlet.
 def _resolve(*args: Any, **kwargs: Any) -> resolver.Answer:
+    from dns import resolver
+
     if hasattr(resolver, "resolve"):
         # dnspython >= 2
         return resolver.resolve(*args, **kwargs)
@@ -81,6 +88,8 @@ class _SrvResolver:
             raise ConfigurationError(_INVALID_HOST_MSG % (fqdn,))
 
     def get_options(self) -> Optional[str]:
+        from dns import resolver
+
         try:
             results = _resolve(self.__fqdn, "TXT", lifetime=self.__connect_timeout)
         except (resolver.NoAnswer, resolver.NXDOMAIN):
@@ -90,7 +99,7 @@ class _SrvResolver:
             raise ConfigurationError(str(exc)) from None
         if len(results) > 1:
             raise ConfigurationError("Only one TXT record is supported")
-        return (b"&".join([b"".join(res.strings) for res in results])).decode("utf-8")
+        return (b"&".join([b"".join(res.strings) for res in results])).decode("utf-8")  # type: ignore[attr-defined]
 
     def _resolve_uri(self, encapsulate_errors: bool) -> resolver.Answer:
         try:
@@ -112,7 +121,8 @@ class _SrvResolver:
 
         # Construct address tuples
         nodes = [
-            (maybe_decode(res.target.to_text(omit_final_dot=True)), res.port) for res in results
+            (maybe_decode(res.target.to_text(omit_final_dot=True)), res.port)  # type: ignore[attr-defined]
+            for res in results
         ]
 
         # Validate hosts

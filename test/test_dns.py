@@ -18,23 +18,35 @@ from __future__ import annotations
 import glob
 import json
 import os
+import pathlib
 import sys
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, client_context, unittest
+from test import (
+    IntegrationTest,
+    PyMongoTestCase,
+    client_context,
+    unittest,
+)
 from test.utils import wait_until
 
 from pymongo.common import validate_read_preference_tags
 from pymongo.errors import ConfigurationError
-from pymongo.mongo_client import MongoClient
 from pymongo.uri_parser import parse_uri, split_hosts
 
+_IS_SYNC = True
 
-class TestDNSRepl(unittest.TestCase):
-    TEST_PATH = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "srv_seedlist", "replica-set"
-    )
+
+class TestDNSRepl(PyMongoTestCase):
+    if _IS_SYNC:
+        TEST_PATH = os.path.join(
+            pathlib.Path(__file__).resolve().parent, "srv_seedlist", "replica-set"
+        )
+    else:
+        TEST_PATH = os.path.join(
+            pathlib.Path(__file__).resolve().parent.parent, "srv_seedlist", "replica-set"
+        )
     load_balanced = False
 
     @client_context.require_replica_set
@@ -42,10 +54,15 @@ class TestDNSRepl(unittest.TestCase):
         pass
 
 
-class TestDNSLoadBalanced(unittest.TestCase):
-    TEST_PATH = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "srv_seedlist", "load-balanced"
-    )
+class TestDNSLoadBalanced(PyMongoTestCase):
+    if _IS_SYNC:
+        TEST_PATH = os.path.join(
+            pathlib.Path(__file__).resolve().parent, "srv_seedlist", "load-balanced"
+        )
+    else:
+        TEST_PATH = os.path.join(
+            pathlib.Path(__file__).resolve().parent.parent, "srv_seedlist", "load-balanced"
+        )
     load_balanced = True
 
     @client_context.require_load_balancer
@@ -53,8 +70,13 @@ class TestDNSLoadBalanced(unittest.TestCase):
         pass
 
 
-class TestDNSSharded(unittest.TestCase):
-    TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "srv_seedlist", "sharded")
+class TestDNSSharded(PyMongoTestCase):
+    if _IS_SYNC:
+        TEST_PATH = os.path.join(pathlib.Path(__file__).resolve().parent, "srv_seedlist", "sharded")
+    else:
+        TEST_PATH = os.path.join(
+            pathlib.Path(__file__).resolve().parent.parent, "srv_seedlist", "sharded"
+        )
     load_balanced = False
 
     @client_context.require_mongos
@@ -120,7 +142,9 @@ def create_test(test_case):
                     # tests.
                     copts["tlsAllowInvalidHostnames"] = True
 
-                client = MongoClient(uri, **copts)
+                client = self.simple_client(uri, **copts)
+                if client._options.connect:
+                    client._connect()
                 if num_seeds is not None:
                     self.assertEqual(len(client._topology_settings.seeds), num_seeds)
                 if hosts is not None:
@@ -157,38 +181,37 @@ create_tests(TestDNSLoadBalanced)
 create_tests(TestDNSSharded)
 
 
-class TestParsingErrors(unittest.TestCase):
+class TestParsingErrors(PyMongoTestCase):
     def test_invalid_host(self):
         self.assertRaisesRegex(
             ConfigurationError,
             "Invalid URI host: mongodb is not",
-            MongoClient,
+            self.simple_client,
             "mongodb+srv://mongodb",
         )
         self.assertRaisesRegex(
             ConfigurationError,
             "Invalid URI host: mongodb.com is not",
-            MongoClient,
+            self.simple_client,
             "mongodb+srv://mongodb.com",
         )
         self.assertRaisesRegex(
             ConfigurationError,
             "Invalid URI host: an IP address is not",
-            MongoClient,
+            self.simple_client,
             "mongodb+srv://127.0.0.1",
         )
         self.assertRaisesRegex(
             ConfigurationError,
             "Invalid URI host: an IP address is not",
-            MongoClient,
+            self.simple_client,
             "mongodb+srv://[::1]",
         )
 
 
 class TestCaseInsensitive(IntegrationTest):
     def test_connect_case_insensitive(self):
-        client = MongoClient("mongodb+srv://TEST1.TEST.BUILD.10GEN.cc/")
-        self.addCleanup(client.close)
+        client = self.simple_client("mongodb+srv://TEST1.TEST.BUILD.10GEN.cc/")
         self.assertGreater(len(client.topology_description.server_descriptions()), 1)
 
 

@@ -1,4 +1,4 @@
-# Copyright 2017 MongoDB, Inc.
+# Copyright 2017-present MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,25 +15,28 @@
 """Test retryable writes."""
 from __future__ import annotations
 
+import asyncio
 import copy
-import os
 import pprint
 import sys
 import threading
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, SkipTest, client_context, client_knobs, unittest
+from test import (
+    IntegrationTest,
+    SkipTest,
+    client_context,
+    unittest,
+)
+from test.helpers import client_knobs
 from test.utils import (
     CMAPListener,
     DeprecationFilter,
     EventListener,
     OvertCommandListener,
-    SpecTestCreator,
-    rs_or_single_client,
     set_fail_point,
 )
-from test.utils_spec_runner import SpecRunner
 from test.version import Version
 
 from bson.codec_options import DEFAULT_CODEC_OPTIONS
@@ -47,7 +50,6 @@ from pymongo.errors import (
     ServerSelectionTimeoutError,
     WriteConcernError,
 )
-from pymongo.mongo_client import MongoClient
 from pymongo.monitoring import (
     CommandSucceededEvent,
     ConnectionCheckedOutEvent,
@@ -65,8 +67,7 @@ from pymongo.operations import (
 )
 from pymongo.write_concern import WriteConcern
 
-# Location of JSON test specifications.
-_TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "retryable_writes", "legacy")
+_IS_SYNC = True
 
 
 class InsertEventListener(EventListener):
@@ -87,44 +88,6 @@ class InsertEventListener(EventListener):
                     },
                 }
             )
-
-
-class TestAllScenarios(SpecRunner):
-    RUN_ON_LOAD_BALANCER = True
-    RUN_ON_SERVERLESS = True
-
-    def get_object_name(self, op):
-        return op.get("object", "collection")
-
-    def get_scenario_db_name(self, scenario_def):
-        return scenario_def.get("database_name", "pymongo_test")
-
-    def get_scenario_coll_name(self, scenario_def):
-        return scenario_def.get("collection_name", "test")
-
-    def run_test_ops(self, sessions, collection, test):
-        # Transform retryable writes spec format into transactions.
-        operation = test["operation"]
-        outcome = test["outcome"]
-        if "error" in outcome:
-            operation["error"] = outcome["error"]
-        if "result" in outcome:
-            operation["result"] = outcome["result"]
-        test["operations"] = [operation]
-        super().run_test_ops(sessions, collection, test)
-
-
-def create_test(scenario_def, test, name):
-    @client_context.require_test_commands
-    @client_context.require_no_mmap
-    def run_scenario(self):
-        self.run_scenario(scenario_def, test)
-
-    return run_scenario
-
-
-test_creator = SpecTestCreator(create_test, TestAllScenarios, _TEST_PATH)
-test_creator.create_tests()
 
 
 def retryable_single_statement_ops(coll):
@@ -169,34 +132,27 @@ class IgnoreDeprecationsTest(IntegrationTest):
     RUN_ON_SERVERLESS = True
     deprecation_filter: DeprecationFilter
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.deprecation_filter = DeprecationFilter()
+    def setUp(self) -> None:
+        super().setUp()
+        self.deprecation_filter = DeprecationFilter()
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.deprecation_filter.stop()
-        super().tearDownClass()
+    def tearDown(self) -> None:
+        self.deprecation_filter.stop()
 
 
 class TestRetryableWritesMMAPv1(IgnoreDeprecationsTest):
     knobs: client_knobs
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
+    def setUp(self) -> None:
+        super().setUp()
         # Speed up the tests by decreasing the heartbeat frequency.
-        cls.knobs = client_knobs(heartbeat_frequency=0.1, min_heartbeat_interval=0.1)
-        cls.knobs.enable()
-        cls.client = rs_or_single_client(retryWrites=True)
-        cls.db = cls.client.pymongo_test
+        self.knobs = client_knobs(heartbeat_frequency=0.1, min_heartbeat_interval=0.1)
+        self.knobs.enable()
+        self.client = self.rs_or_single_client(retryWrites=True)
+        self.db = self.client.pymongo_test
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.knobs.disable()
-        cls.client.close()
-        super().tearDownClass()
+    def tearDown(self) -> None:
+        self.knobs.disable()
 
     @client_context.require_no_standalone
     def test_actionable_error_message(self):
@@ -217,24 +173,16 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
     listener: OvertCommandListener
     knobs: client_knobs
 
-    @classmethod
     @client_context.require_no_mmap
-    def setUpClass(cls):
-        super().setUpClass()
+    def setUp(self) -> None:
+        super().setUp()
         # Speed up the tests by decreasing the heartbeat frequency.
-        cls.knobs = client_knobs(heartbeat_frequency=0.1, min_heartbeat_interval=0.1)
-        cls.knobs.enable()
-        cls.listener = OvertCommandListener()
-        cls.client = rs_or_single_client(retryWrites=True, event_listeners=[cls.listener])
-        cls.db = cls.client.pymongo_test
+        self.knobs = client_knobs(heartbeat_frequency=0.1, min_heartbeat_interval=0.1)
+        self.knobs.enable()
+        self.listener = OvertCommandListener()
+        self.client = self.rs_or_single_client(retryWrites=True, event_listeners=[self.listener])
+        self.db = self.client.pymongo_test
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.knobs.disable()
-        cls.client.close()
-        super().tearDownClass()
-
-    def setUp(self):
         if client_context.is_rs and client_context.test_commands_enabled:
             self.client.admin.command(
                 SON([("configureFailPoint", "onPrimaryTransactionalWrite"), ("mode", "alwaysOn")])
@@ -245,11 +193,11 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
             self.client.admin.command(
                 SON([("configureFailPoint", "onPrimaryTransactionalWrite"), ("mode", "off")])
             )
+        self.knobs.disable()
 
     def test_supported_single_statement_no_retry(self):
         listener = OvertCommandListener()
-        client = rs_or_single_client(retryWrites=False, event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client(retryWrites=False, event_listeners=[listener])
         for method, args, kwargs in retryable_single_statement_ops(client.db.retryable_write_test):
             msg = f"{method.__name__}(*{args!r}, **{kwargs!r})"
             listener.reset()
@@ -260,47 +208,6 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
                     event.command,
                     f"{msg} sent txnNumber with {event.command_name}",
                 )
-
-    @client_context.require_no_standalone
-    def test_supported_single_statement_supported_cluster(self):
-        for method, args, kwargs in retryable_single_statement_ops(self.db.retryable_write_test):
-            msg = f"{method.__name__}(*{args!r}, **{kwargs!r})"
-            self.listener.reset()
-            method(*args, **kwargs)
-            commands_started = self.listener.started_events
-            self.assertEqual(len(self.listener.succeeded_events), 1, msg)
-            first_attempt = commands_started[0]
-            self.assertIn(
-                "lsid",
-                first_attempt.command,
-                f"{msg} sent no lsid with {first_attempt.command_name}",
-            )
-            initial_session_id = first_attempt.command["lsid"]
-            self.assertIn(
-                "txnNumber",
-                first_attempt.command,
-                f"{msg} sent no txnNumber with {first_attempt.command_name}",
-            )
-
-            # There should be no retry when the failpoint is not active.
-            if client_context.is_mongos or not client_context.test_commands_enabled:
-                self.assertEqual(len(commands_started), 1)
-                continue
-
-            initial_transaction_id = first_attempt.command["txnNumber"]
-            retry_attempt = commands_started[1]
-            self.assertIn(
-                "lsid",
-                retry_attempt.command,
-                f"{msg} sent no lsid with {first_attempt.command_name}",
-            )
-            self.assertEqual(retry_attempt.command["lsid"], initial_session_id, msg)
-            self.assertIn(
-                "txnNumber",
-                retry_attempt.command,
-                f"{msg} sent no txnNumber with {first_attempt.command_name}",
-            )
-            self.assertEqual(retry_attempt.command["txnNumber"], initial_transaction_id, msg)
 
     def test_supported_single_statement_unsupported_cluster(self):
         if client_context.is_rs or client_context.is_mongos:
@@ -341,7 +248,7 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
     def test_server_selection_timeout_not_retried(self):
         """A ServerSelectionTimeoutError is not retried."""
         listener = OvertCommandListener()
-        client = MongoClient(
+        client = self.simple_client(
             "somedomainthatdoesntexist.org",
             serverSelectionTimeoutMS=1,
             retryWrites=True,
@@ -361,8 +268,7 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
         original error.
         """
         listener = OvertCommandListener()
-        client = rs_or_single_client(retryWrites=True, event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client(retryWrites=True, event_listeners=[listener])
         topology = client._topology
         select_server = topology.select_server
 
@@ -487,13 +393,12 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
         mongos_clients = []
 
         for mongos in client_context.mongos_seeds().split(","):
-            client = rs_or_single_client(mongos)
+            client = self.rs_or_single_client(mongos)
             set_fail_point(client, fail_command)
-            self.addCleanup(client.close)
             mongos_clients.append(client)
 
         listener = OvertCommandListener()
-        client = rs_or_single_client(
+        client = self.rs_or_single_client(
             client_context.mongos_seeds(),
             appName="retryableWriteTest",
             event_listeners=[listener],
@@ -517,13 +422,12 @@ class TestWriteConcernError(IntegrationTest):
     RUN_ON_SERVERLESS = True
     fail_insert: dict
 
-    @classmethod
     @client_context.require_replica_set
     @client_context.require_no_mmap
     @client_context.require_failCommand_fail_point
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.fail_insert = {
+    def setUp(self) -> None:
+        super().setUp()
+        self.fail_insert = {
             "configureFailPoint": "failCommand",
             "mode": {"times": 2},
             "data": {
@@ -536,8 +440,7 @@ class TestWriteConcernError(IntegrationTest):
     @client_knobs(heartbeat_frequency=0.05, min_heartbeat_interval=0.05)
     def test_RetryableWriteError_error_label(self):
         listener = OvertCommandListener()
-        client = rs_or_single_client(retryWrites=True, event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client(retryWrites=True, event_listeners=[listener])
 
         # Ensure collection exists.
         client.pymongo_test.testcoll.insert_one({})
@@ -589,14 +492,16 @@ class TestPoolPausedError(IntegrationTest):
     RUN_ON_LOAD_BALANCER = False
     RUN_ON_SERVERLESS = False
 
+    @client_context.require_sync
     @client_context.require_failCommand_blockConnection
     @client_context.require_retryable_writes
     @client_knobs(heartbeat_frequency=0.05, min_heartbeat_interval=0.05)
     def test_pool_paused_error_is_retryable(self):
         cmap_listener = CMAPListener()
         cmd_listener = OvertCommandListener()
-        client = rs_or_single_client(maxPoolSize=1, event_listeners=[cmap_listener, cmd_listener])
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client(
+            maxPoolSize=1, event_listeners=[cmap_listener, cmd_listener]
+        )
         for _ in range(10):
             cmap_listener.reset()
             cmd_listener.reset()
@@ -647,6 +552,7 @@ class TestPoolPausedError(IntegrationTest):
         failed = cmd_listener.failed_events
         self.assertEqual(1, len(failed), msg)
 
+    @client_context.require_sync
     @client_context.require_failCommand_fail_point
     @client_context.require_replica_set
     @client_context.require_version_min(
@@ -657,9 +563,8 @@ class TestPoolPausedError(IntegrationTest):
         self,
     ):
         cmd_listener = InsertEventListener()
-        client = rs_or_single_client(retryWrites=True, event_listeners=[cmd_listener])
+        client = self.rs_or_single_client(retryWrites=True, event_listeners=[cmd_listener])
         client.test.test.drop()
-        self.addCleanup(client.close)
         cmd_listener.reset()
         client.admin.command(
             {
@@ -694,8 +599,7 @@ class TestRetryableWritesTxnNumber(IgnoreDeprecationsTest):
         the first attempt fails before sending the command.
         """
         listener = OvertCommandListener()
-        client = rs_or_single_client(retryWrites=True, event_listeners=[listener])
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client(retryWrites=True, event_listeners=[listener])
         topology = client._topology
         select_server = topology.select_server
 

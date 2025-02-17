@@ -23,6 +23,7 @@ from test import unittest
 
 from bson.int64 import Int64
 from bson.objectid import ObjectId
+from pymongo import common
 from pymongo.hello import Hello, HelloCompat
 from pymongo.server_description import ServerDescription
 from pymongo.server_type import SERVER_TYPE
@@ -118,7 +119,7 @@ class TestServerDescription(unittest.TestCase):
                 "maxBsonObjectSize": 2,
                 "maxWriteBatchSize": 3,
                 "minWireVersion": 4,
-                "maxWireVersion": 5,
+                "maxWireVersion": 25,
                 "setName": "rs",
             }
         )
@@ -130,13 +131,15 @@ class TestServerDescription(unittest.TestCase):
         self.assertEqual(2, s.max_bson_size)
         self.assertEqual(3, s.max_write_batch_size)
         self.assertEqual(4, s.min_wire_version)
-        self.assertEqual(5, s.max_wire_version)
+        self.assertEqual(25, s.max_wire_version)
 
-    def test_default_max_message_size(self):
-        s = parse_hello_response({"ok": 1, HelloCompat.LEGACY_CMD: True, "maxBsonObjectSize": 2})
-
-        # Twice max_bson_size.
-        self.assertEqual(4, s.max_message_size)
+    def test_defaults(self):
+        s = parse_hello_response({"ok": 1, HelloCompat.LEGACY_CMD: True})
+        self.assertEqual(common.MAX_BSON_SIZE, s.max_bson_size)
+        self.assertEqual(common.MAX_MESSAGE_SIZE, s.max_message_size)
+        self.assertEqual(common.MIN_WIRE_VERSION, s.min_wire_version)
+        self.assertEqual(common.MAX_WIRE_VERSION, s.max_wire_version)
+        self.assertEqual(common.MAX_WRITE_BATCH_SIZE, s.max_write_batch_size)
 
     def test_standalone(self):
         s = parse_hello_response({"ok": 1, HelloCompat.LEGACY_CMD: True})

@@ -15,6 +15,7 @@
 """Authentication Tests."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
@@ -22,23 +23,28 @@ from urllib.parse import quote_plus
 
 sys.path[0:0] = [""]
 
-from test import IntegrationTest, SkipTest, client_context, unittest
-from test.utils import (
-    AllowListEventListener,
-    delay,
-    ignore_deprecations,
-    rs_or_single_client,
-    rs_or_single_client_noauth,
-    single_client,
-    single_client_noauth,
+from test import (
+    IntegrationTest,
+    PyMongoTestCase,
+    SkipTest,
+    client_context,
+    unittest,
 )
+from test.utils import AllowListEventListener, delay, ignore_deprecations
+
+import pytest
 
 from pymongo import MongoClient, monitoring
-from pymongo.auth import HAVE_KERBEROS, _build_credentials_tuple
+from pymongo.auth_shared import _build_credentials_tuple
 from pymongo.errors import OperationFailure
 from pymongo.hello import HelloCompat
 from pymongo.read_preferences import ReadPreference
 from pymongo.saslprep import HAVE_STRINGPREP
+from pymongo.synchronous.auth import HAVE_KERBEROS, _canonicalize_hostname
+
+_IS_SYNC = True
+
+pytestmark = pytest.mark.auth
 
 # YOU MUST RUN KINIT BEFORE RUNNING GSSAPI TESTS ON UNIX.
 GSSAPI_HOST = os.environ.get("GSSAPI_HOST")
@@ -77,7 +83,7 @@ class AutoAuthenticateThread(threading.Thread):
         self.success = True
 
 
-class TestGSSAPI(unittest.TestCase):
+class TestGSSAPI(PyMongoTestCase):
     mech_properties: str
     service_realm_required: bool
 
@@ -90,10 +96,11 @@ class TestGSSAPI(unittest.TestCase):
         cls.service_realm_required = (
             GSSAPI_SERVICE_REALM is not None and GSSAPI_SERVICE_REALM not in GSSAPI_PRINCIPAL
         )
-        mech_properties = f"SERVICE_NAME:{GSSAPI_SERVICE_NAME}"
-        mech_properties += f",CANONICALIZE_HOST_NAME:{GSSAPI_CANONICALIZE}"
+        mech_properties = dict(
+            SERVICE_NAME=GSSAPI_SERVICE_NAME, CANONICALIZE_HOST_NAME=GSSAPI_CANONICALIZE
+        )
         if GSSAPI_SERVICE_REALM is not None:
-            mech_properties += f",SERVICE_REALM:{GSSAPI_SERVICE_REALM}"
+            mech_properties["SERVICE_REALM"] = GSSAPI_SERVICE_REALM
         cls.mech_properties = mech_properties
 
     def test_credentials_hashing(self):
@@ -134,7 +141,7 @@ class TestGSSAPI(unittest.TestCase):
 
         if not self.service_realm_required:
             # Without authMechanismProperties.
-            client = MongoClient(
+            client = self.simple_client(
                 GSSAPI_HOST,
                 GSSAPI_PORT,
                 username=GSSAPI_PRINCIPAL,
@@ -145,11 +152,11 @@ class TestGSSAPI(unittest.TestCase):
             client[GSSAPI_DB].collection.find_one()
 
             # Log in using URI, without authMechanismProperties.
-            client = MongoClient(uri)
+            client = self.simple_client(uri)
             client[GSSAPI_DB].collection.find_one()
 
         # Authenticate with authMechanismProperties.
-        client = MongoClient(
+        client = self.simple_client(
             GSSAPI_HOST,
             GSSAPI_PORT,
             username=GSSAPI_PRINCIPAL,
@@ -161,15 +168,18 @@ class TestGSSAPI(unittest.TestCase):
         client[GSSAPI_DB].collection.find_one()
 
         # Log in using URI, with authMechanismProperties.
-        mech_uri = uri + f"&authMechanismProperties={self.mech_properties}"
-        client = MongoClient(mech_uri)
+        mech_properties_str = ""
+        for key, value in self.mech_properties.items():
+            mech_properties_str += f"{key}:{value},"
+        mech_uri = uri + f"&authMechanismProperties={mech_properties_str[:-1]}"
+        client = self.simple_client(mech_uri)
         client[GSSAPI_DB].collection.find_one()
 
-        set_name = client.admin.command(HelloCompat.LEGACY_CMD).get("setName")
+        set_name = client_context.replica_set_name
         if set_name:
             if not self.service_realm_required:
                 # Without authMechanismProperties
-                client = MongoClient(
+                client = self.simple_client(
                     GSSAPI_HOST,
                     GSSAPI_PORT,
                     username=GSSAPI_PRINCIPAL,
@@ -181,11 +191,11 @@ class TestGSSAPI(unittest.TestCase):
                 client[GSSAPI_DB].list_collection_names()
 
                 uri = uri + f"&replicaSet={set_name!s}"
-                client = MongoClient(uri)
+                client = self.simple_client(uri)
                 client[GSSAPI_DB].list_collection_names()
 
             # With authMechanismProperties
-            client = MongoClient(
+            client = self.simple_client(
                 GSSAPI_HOST,
                 GSSAPI_PORT,
                 username=GSSAPI_PRINCIPAL,
@@ -198,12 +208,13 @@ class TestGSSAPI(unittest.TestCase):
             client[GSSAPI_DB].list_collection_names()
 
             mech_uri = mech_uri + f"&replicaSet={set_name!s}"
-            client = MongoClient(mech_uri)
+            client = self.simple_client(mech_uri)
             client[GSSAPI_DB].list_collection_names()
 
     @ignore_deprecations
+    @client_context.require_sync
     def test_gssapi_threaded(self):
-        client = MongoClient(
+        client = self.simple_client(
             GSSAPI_HOST,
             GSSAPI_PORT,
             username=GSSAPI_PRINCIPAL,
@@ -237,9 +248,9 @@ class TestGSSAPI(unittest.TestCase):
             thread.join()
             self.assertTrue(thread.success)
 
-        set_name = client.admin.command(HelloCompat.LEGACY_CMD).get("setName")
+        set_name = client_context.replica_set_name
         if set_name:
-            client = MongoClient(
+            client = self.simple_client(
                 GSSAPI_HOST,
                 GSSAPI_PORT,
                 username=GSSAPI_PRINCIPAL,
@@ -261,15 +272,67 @@ class TestGSSAPI(unittest.TestCase):
                 thread.join()
                 self.assertTrue(thread.success)
 
+    def test_gssapi_canonicalize_host_name(self):
+        # Test the low level method.
+        assert GSSAPI_HOST is not None
+        result = _canonicalize_hostname(GSSAPI_HOST, "forward")
+        if "compute-1.amazonaws.com" not in result:
+            self.assertEqual(result, GSSAPI_HOST)
+        result = _canonicalize_hostname(GSSAPI_HOST, "forwardAndReverse")
+        self.assertEqual(result, GSSAPI_HOST)
 
-class TestSASLPlain(unittest.TestCase):
+        # Use the equivalent named CANONICALIZE_HOST_NAME.
+        props = self.mech_properties.copy()
+        if props["CANONICALIZE_HOST_NAME"] == "true":
+            props["CANONICALIZE_HOST_NAME"] = "forwardAndReverse"
+        else:
+            props["CANONICALIZE_HOST_NAME"] = "none"
+        client = self.simple_client(
+            GSSAPI_HOST,
+            GSSAPI_PORT,
+            username=GSSAPI_PRINCIPAL,
+            password=GSSAPI_PASS,
+            authMechanism="GSSAPI",
+            authMechanismProperties=props,
+        )
+        client.server_info()
+
+    def test_gssapi_host_name(self):
+        props = self.mech_properties
+        props["SERVICE_HOST"] = "example.com"
+
+        # Authenticate with authMechanismProperties.
+        client = self.simple_client(
+            GSSAPI_HOST,
+            GSSAPI_PORT,
+            username=GSSAPI_PRINCIPAL,
+            password=GSSAPI_PASS,
+            authMechanism="GSSAPI",
+            authMechanismProperties=self.mech_properties,
+        )
+        with self.assertRaises(OperationFailure):
+            client.server_info()
+
+        props["SERVICE_HOST"] = GSSAPI_HOST
+        client = self.simple_client(
+            GSSAPI_HOST,
+            GSSAPI_PORT,
+            username=GSSAPI_PRINCIPAL,
+            password=GSSAPI_PASS,
+            authMechanism="GSSAPI",
+            authMechanismProperties=self.mech_properties,
+        )
+        client.server_info()
+
+
+class TestSASLPlain(PyMongoTestCase):
     @classmethod
     def setUpClass(cls):
         if not SASL_HOST or not SASL_USER or not SASL_PASS:
             raise SkipTest("Must set SASL_HOST, SASL_USER, and SASL_PASS to test SASL")
 
     def test_sasl_plain(self):
-        client = MongoClient(
+        client = self.simple_client(
             SASL_HOST,
             SASL_PORT,
             username=SASL_USER,
@@ -288,12 +351,12 @@ class TestSASLPlain(unittest.TestCase):
             SASL_PORT,
             SASL_DB,
         )
-        client = MongoClient(uri)
+        client = self.simple_client(uri)
         client.ldap.test.find_one()
 
-        set_name = client.admin.command(HelloCompat.LEGACY_CMD).get("setName")
+        set_name = client_context.replica_set_name
         if set_name:
-            client = MongoClient(
+            client = self.simple_client(
                 SASL_HOST,
                 SASL_PORT,
                 replicaSet=set_name,
@@ -312,7 +375,7 @@ class TestSASLPlain(unittest.TestCase):
                 SASL_DB,
                 str(set_name),
             )
-            client = MongoClient(uri)
+            client = self.simple_client(uri)
             client.ldap.test.find_one()
 
     def test_sasl_plain_bad_credentials(self):
@@ -326,11 +389,13 @@ class TestSASLPlain(unittest.TestCase):
             )
             return uri
 
-        bad_user = MongoClient(auth_string("not-user", SASL_PASS))
-        bad_pwd = MongoClient(auth_string(SASL_USER, "not-pwd"))
+        bad_user = self.simple_client(auth_string("not-user", SASL_PASS))
+        bad_pwd = self.simple_client(auth_string(SASL_USER, "not-pwd"))
         # OperationFailure raised upon connecting.
-        self.assertRaises(OperationFailure, bad_user.admin.command, "ping")
-        self.assertRaises(OperationFailure, bad_pwd.admin.command, "ping")
+        with self.assertRaises(OperationFailure):
+            bad_user.admin.command("ping")
+        with self.assertRaises(OperationFailure):
+            bad_pwd.admin.command("ping")
 
 
 class TestSCRAMSHA1(IntegrationTest):
@@ -343,10 +408,11 @@ class TestSCRAMSHA1(IntegrationTest):
         client_context.drop_user("pymongo_test", "user")
         super().tearDown()
 
+    @client_context.require_no_fips
     def test_scram_sha1(self):
         host, port = client_context.host, client_context.port
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             "mongodb://user:pass@%s:%d/pymongo_test?authMechanism=SCRAM-SHA-1" % (host, port)
         )
         client.pymongo_test.command("dbstats")
@@ -357,13 +423,13 @@ class TestSCRAMSHA1(IntegrationTest):
                 "@%s:%d/pymongo_test?authMechanism=SCRAM-SHA-1"
                 "&replicaSet=%s" % (host, port, client_context.replica_set_name)
             )
-            client = single_client_noauth(uri)
+            client = self.single_client_noauth(uri)
             client.pymongo_test.command("dbstats")
             db = client.get_database("pymongo_test", read_preference=ReadPreference.SECONDARY)
             db.command("dbstats")
 
 
-# https://github.com/mongodb/specifications/blob/master/source/auth/auth.rst#scram-sha-256-and-mechanism-negotiation
+# https://github.com/mongodb/specifications/blob/master/source/auth/auth.md#scram-sha-256-and-mechanism-negotiation
 class TestSCRAM(IntegrationTest):
     @client_context.require_auth
     @client_context.require_version_min(3, 7, 2)
@@ -385,7 +451,7 @@ class TestSCRAM(IntegrationTest):
             "testscram", "sha256", "pwd", roles=["dbOwner"], mechanisms=["SCRAM-SHA-256"]
         )
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="sha256", password="pwd", authSource="testscram", event_listeners=[listener]
         )
         client.testscram.command("dbstats")
@@ -404,6 +470,7 @@ class TestSCRAM(IntegrationTest):
         else:
             self.assertEqual(started, ["saslStart", "saslContinue", "saslContinue"])
 
+    @client_context.require_no_fips
     def test_scram(self):
         # Step 1: create users
         client_context.create_user(
@@ -421,36 +488,38 @@ class TestSCRAM(IntegrationTest):
         )
 
         # Step 2: verify auth success cases
-        client = rs_or_single_client_noauth(username="sha1", password="pwd", authSource="testscram")
+        client = self.rs_or_single_client_noauth(
+            username="sha1", password="pwd", authSource="testscram"
+        )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="sha1", password="pwd", authSource="testscram", authMechanism="SCRAM-SHA-1"
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="sha256", password="pwd", authSource="testscram"
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="sha256", password="pwd", authSource="testscram", authMechanism="SCRAM-SHA-256"
         )
         client.testscram.command("dbstats")
 
         # Step 2: SCRAM-SHA-1 and SCRAM-SHA-256
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="both", password="pwd", authSource="testscram", authMechanism="SCRAM-SHA-1"
         )
         client.testscram.command("dbstats")
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="both", password="pwd", authSource="testscram", authMechanism="SCRAM-SHA-256"
         )
         client.testscram.command("dbstats")
 
         self.listener.reset()
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="both", password="pwd", authSource="testscram", event_listeners=[self.listener]
         )
         client.testscram.command("dbstats")
@@ -463,19 +532,19 @@ class TestSCRAM(IntegrationTest):
             self.assertEqual(started.command.get("mechanism"), "SCRAM-SHA-256")
 
         # Step 3: verify auth failure conditions
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="sha1", password="pwd", authSource="testscram", authMechanism="SCRAM-SHA-256"
         )
         with self.assertRaises(OperationFailure):
             client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="sha256", password="pwd", authSource="testscram", authMechanism="SCRAM-SHA-1"
         )
         with self.assertRaises(OperationFailure):
             client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="not-a-user", password="pwd", authSource="testscram"
         )
         with self.assertRaises(OperationFailure):
@@ -488,7 +557,7 @@ class TestSCRAM(IntegrationTest):
                 port,
                 client_context.replica_set_name,
             )
-            client = single_client_noauth(uri)
+            client = self.single_client_noauth(uri)
             client.testscram.command("dbstats")
             db = client.get_database("testscram", read_preference=ReadPreference.SECONDARY)
             db.command("dbstats")
@@ -508,12 +577,12 @@ class TestSCRAM(IntegrationTest):
             "testscram", "IX", "IX", roles=["dbOwner"], mechanisms=["SCRAM-SHA-256"]
         )
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="\u2168", password="\u2163", authSource="testscram"
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="\u2168",
             password="\u2163",
             authSource="testscram",
@@ -521,17 +590,17 @@ class TestSCRAM(IntegrationTest):
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="\u2168", password="IV", authSource="testscram"
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="IX", password="I\u00ADX", authSource="testscram"
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="IX",
             password="I\u00ADX",
             authSource="testscram",
@@ -539,25 +608,29 @@ class TestSCRAM(IntegrationTest):
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             username="IX", password="IX", authSource="testscram", authMechanism="SCRAM-SHA-256"
         )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth(
+        client = self.rs_or_single_client_noauth(
             "mongodb://\u2168:\u2163@%s:%d/testscram" % (host, port)
         )
         client.testscram.command("dbstats")
-        client = rs_or_single_client_noauth("mongodb://\u2168:IV@%s:%d/testscram" % (host, port))
+        client = self.rs_or_single_client_noauth(
+            "mongodb://\u2168:IV@%s:%d/testscram" % (host, port)
+        )
         client.testscram.command("dbstats")
 
-        client = rs_or_single_client_noauth("mongodb://IX:I\u00ADX@%s:%d/testscram" % (host, port))
+        client = self.rs_or_single_client_noauth(
+            "mongodb://IX:I\u00ADX@%s:%d/testscram" % (host, port)
+        )
         client.testscram.command("dbstats")
-        client = rs_or_single_client_noauth("mongodb://IX:IX@%s:%d/testscram" % (host, port))
+        client = self.rs_or_single_client_noauth("mongodb://IX:IX@%s:%d/testscram" % (host, port))
         client.testscram.command("dbstats")
 
     def test_cache(self):
-        client = single_client()
+        client = self.single_client()
         credentials = client.options.pool_options._credentials
         cache = credentials.cache
         self.assertIsNotNone(cache)
@@ -575,14 +648,14 @@ class TestSCRAM(IntegrationTest):
         self.assertIsInstance(salt, bytes)
         self.assertIsInstance(iterations, int)
 
+    @client_context.require_sync
     def test_scram_threaded(self):
         coll = client_context.client.db.test
         coll.drop()
         coll.insert_one({"_id": 1})
 
         # The first thread to call find() will authenticate
-        client = rs_or_single_client()
-        self.addCleanup(client.close)
+        client = self.rs_or_single_client()
         coll = client.db.test
         threads = []
         for _ in range(4):
@@ -609,7 +682,7 @@ class TestAuthURIOptions(IntegrationTest):
     def test_uri_options(self):
         # Test default to admin
         host, port = client_context.host, client_context.port
-        client = rs_or_single_client_noauth("mongodb://admin:pass@%s:%d" % (host, port))
+        client = self.rs_or_single_client_noauth("mongodb://admin:pass@%s:%d" % (host, port))
         self.assertTrue(client.admin.command("dbstats"))
 
         if client_context.is_rs:
@@ -618,15 +691,16 @@ class TestAuthURIOptions(IntegrationTest):
                 port,
                 client_context.replica_set_name,
             )
-            client = single_client_noauth(uri)
+            client = self.single_client_noauth(uri)
             self.assertTrue(client.admin.command("dbstats"))
             db = client.get_database("admin", read_preference=ReadPreference.SECONDARY)
             self.assertTrue(db.command("dbstats"))
 
         # Test explicit database
         uri = "mongodb://user:pass@%s:%d/pymongo_test" % (host, port)
-        client = rs_or_single_client_noauth(uri)
-        self.assertRaises(OperationFailure, client.admin.command, "dbstats")
+        client = self.rs_or_single_client_noauth(uri)
+        with self.assertRaises(OperationFailure):
+            client.admin.command("dbstats")
         self.assertTrue(client.pymongo_test.command("dbstats"))
 
         if client_context.is_rs:
@@ -635,16 +709,18 @@ class TestAuthURIOptions(IntegrationTest):
                 port,
                 client_context.replica_set_name,
             )
-            client = single_client_noauth(uri)
-            self.assertRaises(OperationFailure, client.admin.command, "dbstats")
+            client = self.single_client_noauth(uri)
+            with self.assertRaises(OperationFailure):
+                client.admin.command("dbstats")
             self.assertTrue(client.pymongo_test.command("dbstats"))
             db = client.get_database("pymongo_test", read_preference=ReadPreference.SECONDARY)
             self.assertTrue(db.command("dbstats"))
 
         # Test authSource
         uri = "mongodb://user:pass@%s:%d/pymongo_test2?authSource=pymongo_test" % (host, port)
-        client = rs_or_single_client_noauth(uri)
-        self.assertRaises(OperationFailure, client.pymongo_test2.command, "dbstats")
+        client = self.rs_or_single_client_noauth(uri)
+        with self.assertRaises(OperationFailure):
+            client.pymongo_test2.command("dbstats")
         self.assertTrue(client.pymongo_test.command("dbstats"))
 
         if client_context.is_rs:
@@ -652,8 +728,9 @@ class TestAuthURIOptions(IntegrationTest):
                 "mongodb://user:pass@%s:%d/pymongo_test2?replicaSet="
                 "%s;authSource=pymongo_test" % (host, port, client_context.replica_set_name)
             )
-            client = single_client_noauth(uri)
-            self.assertRaises(OperationFailure, client.pymongo_test2.command, "dbstats")
+            client = self.single_client_noauth(uri)
+            with self.assertRaises(OperationFailure):
+                client.pymongo_test2.command("dbstats")
             self.assertTrue(client.pymongo_test.command("dbstats"))
             db = client.get_database("pymongo_test", read_preference=ReadPreference.SECONDARY)
             self.assertTrue(db.command("dbstats"))

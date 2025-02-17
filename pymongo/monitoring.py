@@ -20,6 +20,9 @@
     are included in the PyMongo distribution under the
     :mod:`~pymongo.event_loggers` submodule.
 
+.. seealso:: This module is compatible with both the synchronous and asynchronous PyMongo APIs.
+
+
 Use :func:`register` to register global listeners for specific events.
 Listeners must inherit from one of the abstract classes below and implement
 the correct functions for that class.
@@ -191,7 +194,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 from bson.objectid import ObjectId
 from pymongo.hello import Hello, HelloCompat
-from pymongo.helpers import _handle_exception
+from pymongo.helpers_shared import _SENSITIVE_COMMANDS, _handle_exception
 from pymongo.typings import _Address, _DocumentOut
 
 if TYPE_CHECKING:
@@ -469,14 +472,15 @@ def _validate_event_listeners(
 ) -> Sequence[_EventListeners]:
     """Validate event listeners"""
     if not isinstance(listeners, abc.Sequence):
-        raise TypeError(f"{option} must be a list or tuple")
+        raise TypeError(f"{option} must be a list or tuple, not {type(listeners)}")
     for listener in listeners:
         if not isinstance(listener, _EventListener):
             raise TypeError(
                 f"Listeners for {option} must be either a "
                 "CommandListener, ServerHeartbeatListener, "
                 "ServerListener, TopologyListener, or "
-                "ConnectionPoolListener."
+                "ConnectionPoolListener,"
+                f"not {type(listener)}"
             )
     return listeners
 
@@ -493,7 +497,8 @@ def register(listener: _EventListener) -> None:
             f"Listeners for {listener} must be either a "
             "CommandListener, ServerHeartbeatListener, "
             "ServerListener, TopologyListener, or "
-            "ConnectionPoolListener."
+            "ConnectionPoolListener,"
+            f"not {type(listener)}"
         )
     if isinstance(listener, CommandListener):
         _LISTENERS.command_listeners.append(listener)
@@ -505,22 +510,6 @@ def register(listener: _EventListener) -> None:
         _LISTENERS.topology_listeners.append(listener)
     if isinstance(listener, ConnectionPoolListener):
         _LISTENERS.cmap_listeners.append(listener)
-
-
-# Note - to avoid bugs from forgetting which if these is all lowercase and
-# which are camelCase, and at the same time avoid having to add a test for
-# every command, use all lowercase here and test against command_name.lower().
-_SENSITIVE_COMMANDS: set = {
-    "authenticate",
-    "saslstart",
-    "saslcontinue",
-    "getnonce",
-    "createuser",
-    "updateuser",
-    "copydbgetnonce",
-    "copydbsaslstart",
-    "copydb",
-}
 
 
 # The "hello" command is also deemed sensitive when attempting speculative
